@@ -173,12 +173,12 @@ struct TaskMonitorData {
   eTaskState state;
   uint32_t runtime;
   uint32_t prevRuntime;
-  uint64_t runtimeAccumUs; // 64-bit wrap-free accumulator of task runtime in microseconds
+  uint64_t runtimeAccumUs;  // 64-bit wrap-free accumulator of task runtime in microseconds
   uint32_t stackHighWater;
-  uint8_t cpuPercent; // Per-core aware instantaneous CPU%
+  uint8_t cpuPercent;  // Per-core aware instantaneous CPU%
   String stackHealth;
-  BaseType_t coreAffinity; // tskNO_AFFINITY, 0, or 1
-  TaskHandle_t handle; // Store handle for affinity queries
+  BaseType_t coreAffinity;  // tskNO_AFFINITY, 0, or 1
+  TaskHandle_t handle;      // Store handle for affinity queries
 };
 TaskMonitorData taskData[MAX_TASKS_MONITORED];
 uint32_t lastTotalRuntime100ms = 0;
@@ -187,46 +187,23 @@ uint32_t lastTaskSample = 0;
 bool statsInitialized = false;
 // ===== PER-CORE runtime tracking =====
 struct CoreRuntimeData {
-  uint64_t totalRuntime100ms; // Total runtime for this core
-  uint64_t prevTotalRuntime100ms; // Previous sample
-  uint8_t taskCount; // Number of tasks pinned to this core
-  uint8_t cpuPercentTotal; // Sum of all task CPU% (should be ~100%)
+  uint64_t totalRuntime100ms;      // Total runtime for this core
+  uint64_t prevTotalRuntime100ms;  // Previous sample
+  uint8_t taskCount;               // Number of tasks pinned to this core
+  uint8_t cpuPercentTotal;         // Sum of all task CPU% (should be ~100%)
 };
-CoreRuntimeData coreRuntime[2]; // Index 0 = Core 0, Index 1 = Core 1
-uint64_t noAffinityRuntime100ms = 0; // Tasks with no affinity
+CoreRuntimeData coreRuntime[2];       // Index 0 = Core 0, Index 1 = Core 1
+uint64_t noAffinityRuntime100ms = 0;  // Tasks with no affinity
 uint64_t prevNoAffinityRuntime100ms = 0;
 // Long-term wrap-free accumulators (microseconds)
 uint64_t coreAccumUs[2] = { 0, 0 };
 uint64_t noAffinityAccumUs = 0;
 // ISR/Overhead accounting
-uint64_t isrOverheadAccumUs = 0; // accumulated time not accounted to any task
-uint64_t lastSampleWallUs = 0;   // last sample timestamp (esp_timer_get_time)
-// Idle-based effective runtime accumulator (milliseconds across all cores)
-uint64_t idleEffectiveMsAccum = 0;
-uint64_t idleEffLastSampleUs = 0;
-uint64_t lastTotalRuntimeUs = 0; // fallback source when load is unavailable
-static esp_timer_handle_t s_idleEffTimer = NULL;
+uint64_t isrOverheadAccumUs = 0;  // accumulated time not accounted to any task
+uint64_t lastSampleWallUs = 0;    // last sample timestamp (esp_timer_get_time)
 
-static void idleEffTimerCb(void* arg) {
-  (void)arg;
-  uint64_t nowUs = esp_timer_get_time();
-  
-  // First call: seed accumulator to current uptime
-  if (idleEffLastSampleUs == 0) {
-    idleEffectiveMsAccum = nowUs / 1000ULL;  // Seed to current uptime
-    idleEffLastSampleUs = nowUs;
-    return;  // Exit, start accumulating from next callback
-  }
-  
-  uint64_t elapsedUs = nowUs - idleEffLastSampleUs;
-  idleEffLastSampleUs = nowUs;
-  
-  if (elapsedUs == 0) return;
-  if (elapsedUs > 500000ULL) elapsedUs = 500000ULL; // clamp to 500ms window
-  
-  // Accumulate wall-clock time
-  idleEffectiveMsAccum += elapsedUs / 1000ULL;
-}
+
+
 
 uint32_t lastStackCheck = 0;
 // ===== heap tracking =====
@@ -347,10 +324,9 @@ void startCpuLoadMonitor() {
   lastIdle[0] = idleCnt[0];
   lastIdle[1] = idleCnt[1];
   lastLoadTs = millis();
-  
+
   // FIX: Seed integrator to current uptime to avoid startup drift
   uint64_t currentUptimeUs = esp_timer_get_time();
- 
 }
 void updateCpuLoad() {
   uint32_t now = millis();
@@ -364,7 +340,7 @@ void updateCpuLoad() {
     if (ratio > 1.0f) ratio = 1.0f;
     if (ratio < 0.0f) ratio = 0.0f;
     uint8_t newLoad = (uint8_t)(100.0f * (1.0f - ratio) + 0.5f);
-    coreLoadPct[c] = (coreLoadPct[c] + newLoad) / 2; // less smoothing (EMA 1/2)
+    coreLoadPct[c] = (coreLoadPct[c] + newLoad) / 2;  // less smoothing (EMA 1/2)
   }
 }
 // ============================================================================
@@ -470,22 +446,22 @@ void loadNetworkConfig() {
 // temperature helper
 // ============================================================================
 float getInternalTemperatureC() {
-  #if RNGDS_HAS_TEMP
+#if RNGDS_HAS_TEMP
   if (s_temp_sensor == NULL) return NAN;
   float tsens_out;
   if (temperature_sensor_get_celsius(s_temp_sensor, &tsens_out) == ESP_OK) {
     return tsens_out;
   }
   return NAN;
-  #else
+#else
   return NAN;
-  #endif
+#endif
 }
 // ============================================================================
 // BLE send (notify) or stub
 // ============================================================================
 void sendBLE(const String& m) {
-  #if RNGDS_HAS_BLE
+#if RNGDS_HAS_BLE
   if (!bleDeviceConnected || !pTxCharacteristic) return;
   const char* data = m.c_str();
   size_t len = m.length();
@@ -500,9 +476,9 @@ void sendBLE(const String& m) {
       delay(20);
     }
   }
-  #else
+#else
   (void)m;
-  #endif
+#endif
 }
 // ============================================================================
 // BLE init + RX handling
@@ -815,7 +791,7 @@ void checkWiFiConnection() {
         if (status == WL_CONNECTED) {
           wifiState = WIFI_STATE_CONNECTED;
           wifiReconnectAttempts = 0;
-          
+
         } else if (now - wifiLastConnectAttempt > WIFI_CONNECT_TIMEOUT) {
           wifiState = WIFI_STATE_DISCONNECTED;
         }
@@ -868,7 +844,7 @@ String getAffinityString(BaseType_t affinity) {
 static inline BaseType_t getSafeAffinity(TaskHandle_t handle) {
 #if CONFIG_FREERTOS_UNICORE
   (void)handle;
-  return 0; // single-core: treat as core 0
+  return 0;  // single-core: treat as core 0
 #else
   if (handle == nullptr) return tskNO_AFFINITY;
   return xTaskGetAffinity(handle);
@@ -880,11 +856,11 @@ static inline BaseType_t getSafeAffinity(TaskHandle_t handle) {
 void updateTaskMonitoring() {
   if (millis() - lastTaskSample < 500) return;
   lastTaskSample = millis();
-  
+
   uint64_t sampleStartUs = esp_timer_get_time();
   TaskStatus_t statusArray[MAX_TASKS_MONITORED];
   UBaseType_t numTasks = uxTaskGetSystemState(statusArray, MAX_TASKS_MONITORED, NULL);
-  
+
   if (numTasks == 0) return;
   // Reset per-core counters
   for (int c = 0; c < NUM_CORES; c++) {
@@ -897,7 +873,7 @@ void updateTaskMonitoring() {
   for (uint8_t j = 0; j < numTasks; j++) {
     BaseType_t affinity = getSafeAffinity(statusArray[j].xHandle);
     uint32_t runtime = statusArray[j].ulRunTimeCounter;
-    
+
     if (affinity == tskNO_AFFINITY) {
       // Task can migrate between cores
       noAffinityRuntime100ms += (uint64_t)runtime;
@@ -911,12 +887,10 @@ void updateTaskMonitoring() {
   uint64_t coreDelta[2] = { 0, 0 };
   for (int c = 0; c < NUM_CORES; c++) {
     coreDelta[c] = coreRuntime[c].totalRuntime100ms - coreRuntime[c].prevTotalRuntime100ms;
-    if (coreDelta[c] == 0) coreDelta[c] = 1; // Avoid division by zero
-    
-                    
+    if (coreDelta[c] == 0) coreDelta[c] = 1;  // Avoid division by zero
   }
   uint64_t noAffinityDelta = noAffinityRuntime100ms - prevNoAffinityRuntime100ms;
-  
+
   // First time init
   if (!statsInitialized) {
     taskCount = (numTasks > MAX_TASKS_MONITORED) ? MAX_TASKS_MONITORED : numTasks;
@@ -932,7 +906,7 @@ void updateTaskMonitoring() {
       taskData[i].cpuPercent = 0;
       taskData[i].handle = statusArray[i].xHandle;
       taskData[i].coreAffinity = getSafeAffinity(statusArray[i].xHandle);
-      
+
       // No seeding of core accumulators at init; accumulate only deltas to avoid double counting
     }
     for (int c = 0; c < NUM_CORES; c++) {
@@ -943,7 +917,7 @@ void updateTaskMonitoring() {
     return;
   }
   // Update existing tasks with PER-CORE CPU calculation
-  uint64_t sumTaskDeltaUs = 0; // sum of all task deltas in this window
+  uint64_t sumTaskDeltaUs = 0;  // sum of all task deltas in this window
   for (uint8_t i = 0; i < taskCount; i++) {
     bool found = false;
     for (uint8_t j = 0; j < numTasks; j++) {
@@ -951,7 +925,7 @@ void updateTaskMonitoring() {
         uint32_t currentRuntime100ms = statusArray[j].ulRunTimeCounter;
         uint64_t taskDelta100ms = (uint64_t)currentRuntime100ms - taskData[i].prevRuntime;
         if (currentRuntime100ms < taskData[i].prevRuntime) {
-          taskDelta100ms += (1ULL << 32); // Handle single wrap
+          taskDelta100ms += (1ULL << 32);  // Handle single wrap
         }
         sumTaskDeltaUs += taskDelta100ms;
         // accumulate wrap-free per-task runtime in microseconds
@@ -975,26 +949,23 @@ void updateTaskMonitoring() {
           if (totalCoreDelta > 0) {
             uint64_t percentage = (taskDelta100ms * 100ULL) / totalCoreDelta;
             taskData[i].cpuPercent = (percentage > 100) ? 100 : (uint8_t)percentage;
-            
+
           } else {
             taskData[i].cpuPercent = 0;
-            
           }
         } else if (affinity >= 0 && affinity < NUM_CORES) {
           // Task pinned to specific core - calculate against that core only
           if (coreDelta[affinity] > 0) {
             uint64_t percentage = (taskDelta100ms * 100ULL) / coreDelta[affinity];
             taskData[i].cpuPercent = (percentage > 100) ? 100 : (uint8_t)percentage;
-            
+
           } else {
             taskData[i].cpuPercent = 0;
-            
           }
           coreRuntime[affinity].cpuPercentTotal += taskData[i].cpuPercent;
-          
+
         } else {
           taskData[i].cpuPercent = 0;
-          
         }
         taskData[i].priority = statusArray[j].uxCurrentPriority;
         taskData[i].state = statusArray[j].eCurrentState;
@@ -1034,67 +1005,33 @@ void updateTaskMonitoring() {
       taskData[taskCount].handle = statusArray[j].xHandle;
       taskData[taskCount].coreAffinity = getSafeAffinity(statusArray[j].xHandle);
       taskCount++;
-      
+
       // No seeding at add; we accumulate only per-sample deltas
     }
   }
   // Store totals for next sample
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].prevTotalRuntime100ms = coreRuntime[c].totalRuntime100ms;
-    
   }
   prevNoAffinityRuntime100ms = noAffinityRuntime100ms;
-  
+
 
   // ISR/overhead: anything not accounted to tasks in this window
   if (lastSampleWallUs != 0) {
     uint64_t wallDeltaUsAllCores = (sampleStartUs - lastSampleWallUs) * (uint64_t)NUM_CORES;
     uint64_t overheadDeltaUs = (wallDeltaUsAllCores > sumTaskDeltaUs) ? (wallDeltaUsAllCores - sumTaskDeltaUs) : 0;
     isrOverheadAccumUs += overheadDeltaUs;
-    
   }
   lastSampleWallUs = sampleStartUs;
 }
-// ============================================================================
-// Runtime Drift Diagnostics
-// ============================================================================
-static uint64_t lastDriftCheckUs = 0;
-static uint64_t driftAccumUs = 0;
-void diagRuntimeDrift() {
-  const uint64_t tNow = micros64();
-  if (lastDriftCheckUs == 0) {
-    lastDriftCheckUs = tNow;
-    return;
-  }
-  const uint64_t deltaUs = tNow - lastDriftCheckUs;
-  lastDriftCheckUs = tNow;
-  driftAccumUs += deltaUs;
-  
-}
+
+
 
 // ============================================================================
 // Focused Runtime Metrics Serial Output
 // ============================================================================
 static uint32_t lastRuntimePrintMs = 0;
-void printRuntimeMetrics() {
-  uint32_t now = millis();
-  if (now - lastRuntimePrintMs < 5000) return; // print every 5s
-  lastRuntimePrintMs = now;
 
-  uint64_t uptime_ms = esp_timer_get_time() / 1000ULL;
-
-  // Use cumulative idle-based effective runtime derived in systemTask
-  uint64_t total_cpu_time_ms = idleEffectiveMsAccum;
-  uint64_t effective_runtime_ms = (NUM_CORES > 0) ? (idleEffectiveMsAccum / NUM_CORES) : 0;
-  int64_t diff_ms = (int64_t)uptime_ms - (int64_t)effective_runtime_ms;
-  float diff_pct = (uptime_ms > 0) ? ((float)diff_ms / (float)uptime_ms) * 100.0f : 0.0f;
-
-  
-
-  for (int c = 0; c < NUM_CORES; c++) {
-    
-  }
-}
 // ============================================================================
 // API endpoints
 // ============================================================================
@@ -1149,63 +1086,49 @@ static void handleApiStatus() {
 void sendDebugInfo() {
   DynamicJsonDocument doc(4096);
   uint64_t uptime_ms = esp_timer_get_time() / 1000ULL;
-  uint64_t esp_timer_us = esp_timer_get_time();
-  
+
   doc["uptime_ms"] = uptime_ms;
-  doc["esp_timer_us"] = esp_timer_us;
   doc["heap_free"] = ESP.getFreeHeap();
   doc["connected"] = (WiFi.status() == WL_CONNECTED);
+
   float t = getInternalTemperatureC();
   if (!isnan(t)) doc["temp_c"] = t;
   else doc["temp_c"] = nullptr;
-  // Simplified totals based on idle-derived load
-  // Use cumulative idle-based effective runtime derived in systemTask
-  uint64_t total_cpu_time_ms = idleEffectiveMsAccum;
-  uint64_t effective_runtime_ms = (NUM_CORES > 0) ? (idleEffectiveMsAccum / NUM_CORES) : 0;
-  doc["runtime_counter"] = nullptr;
-  doc["runtime_resolution"] = "derived_from_idle";
-  doc["total_cpu_time_ms"] = total_cpu_time_ms;
-  doc["effective_runtime_ms"] = effective_runtime_ms;
-  
-  doc["isr_overhead_us"] = nullptr; // deprecated in idle-based effective runtime
-  doc["isr_overhead_percent"] = nullptr;
+
   doc["num_tasks"] = taskCount;
-  JsonObject timing = doc.createNestedObject("timing_analysis");
-  int64_t diff_ms = (int64_t)uptime_ms - (int64_t)effective_runtime_ms;
-  float diff_pct = (uptime_ms > 0) ? ((float)diff_ms / uptime_ms) * 100.0f : 0;
-  timing["uptime_vs_effective_diff_ms"] = diff_ms;
-  timing["difference_percent"] = diff_pct;
-  timing["status"] = (abs(diff_pct) < 5.0f) ? "GOOD" : "ISSUE";
-  
+
+  // Simplified - no redundant timing analysis needed
   JsonObject cpu = doc.createNestedObject("cpu_load");
   cpu["core0_percent"] = coreLoadPct[0];
   cpu["core1_percent"] = coreLoadPct[1];
+
   JsonObject coresDetail = doc.createNestedObject("cores_detail");
   for (int c = 0; c < NUM_CORES; c++) {
     JsonObject core = coresDetail.createNestedObject(String(c));
     core["tasks"] = coreRuntime[c].taskCount;
-    core["runtime_ticks"] = (uint64_t)coreAccumUs[c];
+    core["runtime_us"] = (uint64_t)coreAccumUs[c];
     core["runtime_ms"] = (double)coreAccumUs[c] / 1000.0;
     core["cpu_total_pct"] = coreRuntime[c].cpuPercentTotal;
-    core["idle_load"] = coreLoadPct[c];
+    core["idle_load_pct"] = coreLoadPct[c];
   }
+
   doc["no_affinity_runtime_us"] = (uint64_t)noAffinityAccumUs;
+
   JsonArray tasks = doc.createNestedArray("top_tasks");
   for (uint8_t i = 0; i < taskCount; i++) {
     JsonObject tt = tasks.createNestedObject();
     tt["name"] = taskData[i].name;
-    tt["runtime_ticks"] = taskData[i].runtime;
-    double task_ms = (double)taskData[i].runtime / 1000.0;
-    tt["runtime_ms"] = task_ms;
-    tt["runtime_seconds"] = task_ms / 1000.0;
+    tt["runtime_us"] = (uint64_t)taskData[i].runtimeAccumUs;
+    tt["runtime_ms"] = (double)taskData[i].runtimeAccumUs / 1000.0;
     tt["percent_of_core"] = taskData[i].cpuPercent;
     tt["state"] = getTaskStateName(taskData[i].state);
     tt["priority"] = taskData[i].priority;
     tt["stack_hwm"] = taskData[i].stackHighWater;
     tt["core_affinity"] = getAffinityString(taskData[i].coreAffinity);
   }
+
   String output;
-  output.reserve(5120);
+  output.reserve(4096);
   serializeJson(doc, output);
   server.send(200, "application/json", output);
 }
@@ -1217,7 +1140,7 @@ void sendTaskMonitoring() {
     t["name"] = taskData[i].name;
     t["priority"] = taskData[i].priority;
     t["state"] = getTaskStateName(taskData[i].state);
-    t["runtime"] = (uint64_t)taskData[i].runtimeAccumUs / 1000000ULL; // seconds (wrap-free)
+    t["runtime"] = (uint64_t)taskData[i].runtimeAccumUs / 1000000ULL;  // seconds (wrap-free)
     t["stack_hwm"] = taskData[i].stackHighWater;
     t["stack_health"] = taskData[i].stackHealth;
     t["cpu_percent"] = taskData[i].cpuPercent;
@@ -1322,8 +1245,7 @@ void hBizStop() {
   server.send(200, "application/json", "{\"msg\":\"stopped\"}");
 }
 // ============================================================================
-// HTML Dashboard - COPY/PASTE THIS ENTIRE SECTION INTO YOUR .INO FILE
-// Replace the INDEX_HTML_DASHBOARD placeholder with these constants
+// HTML Dashboard - Simplified (No Timing Drift)
 // ============================================================================
 // Main HTML - Always included
 static const char INDEX_HTML_PART1[] PROGMEM = R"rawliteral(
@@ -1385,9 +1307,6 @@ pre {background:#0d1117;color:#c9d1d9;padding:10px;border-radius:4px;overflow-x:
 .alert.success {background:#0d1117;border-color:#238636;color:#3fb950}
 .alert.error {background:#0d1117;border-color:#da3633;color:#f85149}
 .alert.info {background:#0d1117;border-color:#1f6feb;color:#58a6ff}
-.debug-status {padding:4px 8px;border-radius:4px;font-size:0.8em;font-weight:bold}
-.debug-good {background:#238636;color:#fff}
-.debug-issue {background:#da3633;color:#fff}
 </style>
 </head>
 <body>
@@ -1465,36 +1384,17 @@ pre {background:#0d1117;color:#c9d1d9;padding:10px;border-radius:4px;overflow-x:
  <div id="taskMonitor"><p style="text-align:center;color:#8b949e;padding:12px">Loading...</p></div>
 </div>
 )rawliteral";
+
 // Debug Panel - Only included if DEBUG_MODE is enabled
 #if DEBUG_MODE
 static const char INDEX_HTML_DEBUG[] PROGMEM = R"rawliteral(
 <div class="card">
- <h3>Debug Panel <span class="small">Timing & Core Analysis</span></h3>
- <div id="debugSummary" style="margin-bottom:10px"></div>
- <pre id="debugOutput" style="max-height:300px"></pre>
- <h4>Timing Drift Log</h4>
- <div class="row">
-  <span class="pill">Samples: <span id="timingLogCount">0</span></span>
-  <button class="btn secondary" onclick="saveTimingCSV()">Save CSV</button>
-  <button class="btn secondary" onclick="clearTimingLog()">Clear</button>
- </div>
- <div style="max-height:260px;overflow:auto;margin-top:8px">
-  <table class="task-table" id="timingTable">
-   <thead>
-    <tr>
-     <th>#</th><th>Uptime (ms)</th><th>Runtime (ms)</th>
-     <th>Drift (ms)</th><th>Drift Δ</th><th>Drift %</th><th>Status</th>
-     <th>C0 %</th><th>C1 %</th><th>Heap</th><th>Temp</th>
-     <th>Top Task</th><th>Top %</th>
-     <th>Web %</th><th>Biz %</th><th>Sys %</th>
-    </tr>
-   </thead>
-   <tbody></tbody>
-  </table>
- </div>
+ <h3>Debug Panel <span class="small">Core & Task Analysis</span></h3>
+ <pre id="debugOutput" style="max-height:400px"></pre>
 </div>
 )rawliteral";
 #endif
+
 // JavaScript - Always included
 static const char INDEX_HTML_PART2[] PROGMEM = R"rawliteral(
 </div>
@@ -1593,132 +1493,53 @@ async function refresh(){
  }
 }
 )rawliteral";
+
 // Debug JavaScript - Only included if DEBUG_MODE is enabled
 #if DEBUG_MODE
 static const char INDEX_HTML_DEBUG_JS[] PROGMEM = R"rawliteral(
-let timingLog=[];
-const MAX_TIMING_ENTRIES=500;
-function addTimingLogEntry(j) {
- if (!j.timing_analysis) return;
- const t = j.timing_analysis;
- const uptime = j.uptime_ms;
- const runtime = j.effective_runtime_ms;
- const drift = t.uptime_vs_effective_diff_ms;
- const diffPct = t.difference_percent;
- const status = t.status || 'N/A';
- const core0 = j.cpu_load ? j.cpu_load.core0_percent : '-';
- const core1 = j.cpu_load ? j.cpu_load.core1_percent : '-';
- const temp = (j.temp_c && !isNaN(j.temp_c)) ? j.temp_c.toFixed(1) : '-';
- const heap = j.heap_free ?? 0;
- let top='-', topPct='-', webPct='-', bizPct='-', sysPct='-';
- if (Array.isArray(j.top_tasks)) {
-  j.top_tasks.sort((a,b) => b.percent_of_core - a.percent_of_core);
-  const topTask = j.top_tasks[0];
-  if(topTask){
-   top = topTask.name;
-   topPct = (topTask.percent_of_core || 0).toFixed(1);
-  }
-  j.top_tasks.forEach(tt=>{
-   const name=tt.name.toLowerCase();
-   if(name.includes('web')) webPct=tt.percent_of_core.toFixed(1);
-   if(name.includes('biz')) bizPct=tt.percent_of_core.toFixed(1);
-   if(name.includes('sys')) sysPct=tt.percent_of_core.toFixed(1);
-  });
- }
- let prevDrift = timingLog.length>0 ? timingLog[0].drift : drift;
- const driftDelta = drift - prevDrift;
- const entry = {uptime,runtime,drift,driftDelta,diffPct,status,core0,core1,temp,heap,
-        top,topPct,webPct,bizPct,sysPct};
- timingLog.unshift(entry);
- if(timingLog.length>MAX_TIMING_ENTRIES) timingLog.pop();
- const tbody = I('timingTable').querySelector('tbody');
- const row=document.createElement('tr');
- const cls=status==='GOOD'?'health-good':(status==='ISSUE'?'health-critical':'');
- const driftCls=Math.abs(driftDelta)>50?'health-low':'';
- row.innerHTML=`
-  <td>${timingLog.length}</td>
-  <td>${uptime}</td>
-  <td>${runtime}</td>
-  <td>${drift}</td>
-  <td class="${driftCls}">${driftDelta>0?'+':''}${driftDelta}</td>
-  <td>${diffPct.toFixed(2)}</td>
-  <td class="${cls}">${status}</td>
-  <td>${core0}</td>
-  <td>${core1}</td>
-  <td>${heap}</td>
-  <td>${temp}</td>
-  <td>${top}</td>
-  <td>${topPct}%</td>
-  <td>${webPct}%</td>
-  <td>${bizPct}%</td>
-  <td>${sysPct}%</td>`;
- tbody.insertBefore(row, tbody.firstChild);
- if(tbody.rows.length>MAX_TIMING_ENTRIES) tbody.deleteRow(-1);
- I('timingLogCount').textContent=timingLog.length;
-}
-function saveTimingCSV(){
- if(!timingLog.length){alert('No timing data');return;}
- const header='index,uptime_ms,effective_runtime_ms,drift_ms,drift_delta_ms,drift_percent,status,core0,core1,temp_c,heap_free,top_task,top_percent,web_percent,biz_percent,sys_percent\n';
- const csv=header+timingLog.map((e,i)=>
-  `${i+1},${e.uptime},${e.runtime},${e.drift},${e.driftDelta},${e.diffPct.toFixed(3)},${e.status},${e.core0},${e.core1},${e.temp},${e.heap},${e.top},${e.topPct},${e.webPct},${e.bizPct},${e.sysPct}`).join('\n');
- const blob=new Blob([csv],{type:'text/csv'});
- const url=URL.createObjectURL(blob);
- const a=document.createElement('a');
- a.href=url;a.download='timing_log.csv';a.click();
- setTimeout(()=>URL.revokeObjectURL(url),1000);
-}
-function clearTimingLog(){
- if(confirm('Clear all timing data?')){
-  timingLog=[];
-  I('timingTable').querySelector('tbody').innerHTML='';
-  I('timingLogCount').textContent='0';
- }
-}
 async function refreshDebug(){
  const j=await api('/api/debug');
  if(!j||j.error){I('debugOutput').textContent='Error: '+(j?j.error:'no data');return;}
- let summary=`<span class="pill">Uptime: ${fmU(j.uptime_ms)}</span>`;
- summary+=`<span class="pill">Effective Runtime: ${fmU(j.effective_runtime_ms)}</span>`;
- if(j.timing_analysis){
-  const cls=j.timing_analysis.status==='GOOD'?'debug-good':'debug-issue';
-  summary+=` <span class="debug-status ${cls}">${j.timing_analysis.status}: ${j.timing_analysis.difference_percent.toFixed(2)}%</span>`;
- }
- I('debugSummary').innerHTML=summary;
- let out='=== TIMING ANALYSIS ===\n';
- out+=`Uptime: ${j.uptime_ms} ms (${fmU(j.uptime_ms)})\n`;
- out+=`Total CPU Time: ${j.total_cpu_time_ms} ms\n`;
- out+=`Effective Runtime: ${j.effective_runtime_ms} ms\n`;
- if(j.timing_analysis){
-  out+=`Drift: ${j.timing_analysis.uptime_vs_effective_diff_ms} ms (${j.timing_analysis.difference_percent.toFixed(3)}%)\n`;
-  out+=`Status: ${j.timing_analysis.status}\n`;
- }
- if(j.cores_detail){
-  out+='\n=== PER-CORE BREAKDOWN ===\n';
-  for(let c in j.cores_detail){
-   const core=j.cores_detail[c];
-   out+=`Core ${c}: ${core.tasks} tasks, ${core.cpu_total_pct}% total, ${core.idle_load}% idle-based\n`;
-  }
+ let out='=== SYSTEM INFO ===\n';
+ out+=`Uptime: ${fmU(j.uptime_ms)}\n`;
+ out+=`Heap Free: ${fmB(j.heap_free)}\n`;
+ out+=`Tasks: ${j.num_tasks}\n`;
+ if(j.temp_c!==null&&j.temp_c!==undefined){
+  out+=`Temp: ${j.temp_c.toFixed(1)}°C\n`;
  }
  if(j.cpu_load){
   out+=`\n=== CPU LOAD (Idle-based) ===\n`;
   out+=`Core 0: ${j.cpu_load.core0_percent}%\n`;
   out+=`Core 1: ${j.cpu_load.core1_percent}%\n`;
  }
+ if(j.cores_detail){
+  out+='\n=== PER-CORE BREAKDOWN ===\n';
+  for(let c in j.cores_detail){
+   const core=j.cores_detail[c];
+   out+=`Core ${c}: ${core.tasks} tasks, ${(core.runtime_ms/1000).toFixed(1)}s total runtime\n`;
+   out+=`         CPU: ${core.cpu_total_pct}% (sum), Load: ${core.idle_load_pct}%\n`;
+  }
+ }
  if(j.top_tasks){
   out+='\n=== TOP TASKS (by CPU%) ===\n';
   j.top_tasks.sort((a,b) => b.percent_of_core - a.percent_of_core);
-  const top_8 = j.top_tasks.slice(0, 8);
-  top_8.forEach(t=>{
-   out+=` ${t.name.padEnd(12)} Core ${t.core_affinity} | ${t.percent_of_core.toFixed(1)}% | ${t.runtime_ms.toFixed(0)}ms | ${t.state}\n`;
+  const top_10 = j.top_tasks.slice(0, 10);
+  top_10.forEach(t=>{
+   const name=t.name.padEnd(14,' ');
+   const core=String(t.core_affinity).padStart(3,' ');
+   const pct=String(t.percent_of_core.toFixed(1)+'%').padStart(6,' ');
+   const runtime=String((t.runtime_ms/1000).toFixed(1)+'s').padStart(8,' ');
+   const state=String(t.state).padEnd(8,' ');
+   out+=` ${name} C${core} ${pct} ${runtime} ${state}\n`;
   });
  }
  I('debugOutput').textContent=out;
- addTimingLogEntry(j);
 }
 setInterval(refreshDebug, 3000);
 refreshDebug();
 )rawliteral";
 #endif
+
 // Closing JavaScript and HTML - Always included
 static const char INDEX_HTML_END[] PROGMEM = R"rawliteral(
 setInterval(refresh,2000);
@@ -1798,7 +1619,7 @@ void systemTask(void* param) {
     updateCpuLoad();
     monitorHeapHealth();
     checkTaskStacks();
-    
+
     if (bleDeviceConnected) {
       uint32_t now = millis();
       if (now - ledTs > BLE_LED_BLINK_MS) {
@@ -1810,8 +1631,7 @@ void systemTask(void* param) {
       digitalWrite(BLE_LED_PIN, LOW);
       ledState = false;
     }
-    diagRuntimeDrift();
-    printRuntimeMetrics();
+
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -1847,12 +1667,12 @@ void bizTask(void* param) {
 // setup + loop
 // ============================================================================
 void setup() {
-  
+
   delay(300);
   esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_log_level_set("dhcpc", ESP_LOG_WARN);
   esp_log_level_set("phy_init", ESP_LOG_WARN);
-  
+
   esp_task_wdt_deinit();
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = WDT_TIMEOUT * 1000,
@@ -1885,31 +1705,19 @@ void setup() {
   }
   // Calibrate CPU load BEFORE creating tasks
   startCpuLoadMonitor();
-  // Start idle-based effective runtime integrator (100 ms cadence)
-  if (s_idleEffTimer == NULL) {
-    const esp_timer_create_args_t args = {
-      .callback = idleEffTimerCb,
-      .arg = NULL,
-      .dispatch_method = ESP_TIMER_TASK,
-      .name = "idle_eff"
-    };
-    if (esp_timer_create(&args, &s_idleEffTimer) == ESP_OK) {
-      esp_timer_start_periodic(s_idleEffTimer, 100000); // 100 ms
-    }
-  }
+
 #if NUM_CORES > 1
   xTaskCreatePinnedToCore(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle, 1);
   xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, &webTaskHandle, 0);
   xTaskCreatePinnedToCore(systemTask, "sys", 3072, nullptr, 2, &sysTaskHandle, 0);
-  
+
 #else
   xTaskCreate(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle);
   xTaskCreate(webTask, "web", 8192, nullptr, 1, &webTaskHandle);
   xTaskCreate(systemTask, "sys", 3072, nullptr, 2, &sysTaskHandle);
-  
+
 #endif
   minHeapEver = ESP.getFreeHeap();
-  
 }
 void loop() {
   vTaskDelete(NULL);
