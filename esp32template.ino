@@ -82,11 +82,7 @@ struct ExecMessage {
 };
 
 // CPU load monitoring (declare early for use in callbacks)
-volatile uint32_t idleCnt[2] = { 0, 0 };
-volatile uint32_t idleCal[2] = { 1, 1 };
-volatile uint32_t lastIdle[2] = { 0, 0 };
 volatile uint8_t coreLoadPct[2] = { 0, 0 };
-uint32_t lastLoadTs = 0;
 
 // FreeRTOS runtime counter (microsecond resolution, 584k year wrap time)
 static uint64_t runtimeOffsetUs = 0;
@@ -189,10 +185,9 @@ struct CoreRuntimeData {
 
 CoreRuntimeData coreRuntime[2];
 uint64_t noAffinityRuntime100ms = 0;
-uint64_t prevNoAffinityRuntime100ms = 0;
-uint64_t noAffinityAccumUs = 0;  
+
 uint64_t coreAccumUs[2] = { 0, 0 };
-uint64_t lastSampleWallUs = 0;
+uint64_t noAffinityAccumUs = 0;
 uint32_t lastStackCheck = 0;
 
 // Business logic
@@ -273,56 +268,52 @@ void freeMessage(ExecMessage* msg) {
   }
 }
 
-// ============================================================================
-// CPU Load Monitoring
-// ============================================================================
-extern "C" bool idleHook0() {
-  idleCnt[0]++;
-  return true;
-}
-
-#if NUM_CORES > 1
-extern "C" bool idleHook1() {
-  idleCnt[1]++;
-  return true;
-}
-#endif
-
-void startCpuLoadMonitor() {
-  esp_register_freertos_idle_hook_for_cpu(idleHook0, 0);
-#if NUM_CORES > 1
-  esp_register_freertos_idle_hook_for_cpu(idleHook1, 1);
-#endif
-
-  uint32_t s0[2] = { idleCnt[0], idleCnt[1] };
-  uint64_t t0 = esp_timer_get_time();
-  delay(3000);
-  uint64_t t1 = esp_timer_get_time();
-  uint32_t d0 = idleCnt[0] - s0[0];
-  uint32_t d1 = (NUM_CORES > 1) ? (idleCnt[1] - s0[1]) : 1;
-  uint32_t elapsedMs = (t1 - t0) / 1000;
-
-  idleCal[0] = max(1UL, (uint32_t)((float)d0 * (1000.0f / elapsedMs)));
-  idleCal[1] = max(1UL, (uint32_t)((float)d1 * (1000.0f / elapsedMs)));
-  lastIdle[0] = idleCnt[0];
-  lastIdle[1] = idleCnt[1];
-  lastLoadTs = millis();
-}
-
 void updateCpuLoad() {
-  uint32_t now = millis();
-  if (now - lastLoadTs < 1000) return;
+  static uint32_t lastTotalRuntime = 0;
+  static uint32_t lastIdleRuntime[2] = { 0, 0 };
 
-  uint32_t elapsed = now - lastLoadTs;
-  lastLoadTs = now;
+  static TaskStatus_t statusArray[MAX_TASKS_MONITORED];
+  uint32_t totalRuntime;
+  UBaseType_t numTasks = uxTaskGetSystemState(statusArray, MAX_TASKS_MONITORED, &totalRuntime);
 
-  for (int c = 0; c < NUM_CORES; c++) {
-    uint32_t di = idleCnt[c] - lastIdle[c];
-    lastIdle[c] = idleCnt[c];
-    float ratio = (float)(di * (1000.0f / elapsed)) / idleCal[c];
-    ratio = constrain(ratio, 0.0f, 1.0f);
-    uint8_t newLoad = (uint8_t)(100.0f * (1.0f - ratio) + 0.5f);
-    coreLoadPct[c] = (coreLoadPct[c] + newLoad) / 2;
+  // Calculate delta - skip if too small to avoid division issues
+  uint32_t totalDelta = totalRuntime - lastTotalRuntime;
+  if (totalDelta < 100000) return;  // Skip if less than ~100ms elapsed
+
+  lastTotalRuntime = totalRuntime;
+
+  // Find IDLE tasks and calculate their percentage
+  for (UBaseType_t i = 0; i < numTasks; i++) {
+    String name = String(statusArray[i].pcTaskName);
+
+    if (name.equals("IDLE0") || name.equals("IDLE")) {
+      uint32_t idleDelta = statusArray[i].ulRunTimeCounter - lastIdleRuntime[0];
+      lastIdleRuntime[0] = statusArray[i].ulRunTimeCounter;
+
+      // Prevent division issues - calculate idle percentage safely
+      uint64_t perCoreDelta = (uint64_t)totalDelta;
+      if (NUM_CORES > 1) {
+        perCoreDelta = totalDelta / 2;  // Divide total time by number of cores
+      }
+
+      if (perCoreDelta > 0) {
+        uint64_t idlePct = ((uint64_t)idleDelta * 100ULL) / perCoreDelta;
+        coreLoadPct[0] = (idlePct > 100) ? 0 : (100 - (uint8_t)idlePct);
+      }
+    } else if (name.equals("IDLE1")) {
+      uint32_t idleDelta = statusArray[i].ulRunTimeCounter - lastIdleRuntime[1];
+      lastIdleRuntime[1] = statusArray[i].ulRunTimeCounter;
+
+      uint64_t perCoreDelta = (uint64_t)totalDelta;
+      if (NUM_CORES > 1) {
+        perCoreDelta = totalDelta / 2;
+      }
+
+      if (perCoreDelta > 0) {
+        uint64_t idlePct = ((uint64_t)idleDelta * 100ULL) / perCoreDelta;
+        coreLoadPct[1] = (idlePct > 100) ? 0 : (100 - (uint8_t)idlePct);
+      }
+    }
   }
 }
 
@@ -846,7 +837,6 @@ void updateTaskMonitoring() {
   if (millis() - lastTaskSample < 500) return;
   lastTaskSample = millis();
 
-  uint64_t sampleStartUs = esp_timer_get_time();
   TaskStatus_t statusArray[MAX_TASKS_MONITORED];
   UBaseType_t numTasks = uxTaskGetSystemState(statusArray, MAX_TASKS_MONITORED, NULL);
   if (numTasks == 0) return;
@@ -898,13 +888,11 @@ void updateTaskMonitoring() {
     for (int c = 0; c < NUM_CORES; c++) {
       coreRuntime[c].prevTotalRuntime100ms = coreRuntime[c].totalRuntime100ms;
     }
-    prevNoAffinityRuntime100ms = noAffinityRuntime100ms;
-    statsInitialized = true;
+     statsInitialized = true;
     return;
   }
 
   // Update existing tasks with per-core CPU calculation
-  uint64_t sumTaskDeltaUs = 0;
   for (uint8_t i = 0; i < taskCount; i++) {
     bool found = false;
     for (uint8_t j = 0; j < numTasks; j++) {
@@ -914,7 +902,7 @@ void updateTaskMonitoring() {
         if (currentRuntime100ms < taskData[i].prevRuntime) {
           taskDelta100ms += (1ULL << 32);
         }
-        sumTaskDeltaUs += taskDelta100ms;
+
         taskData[i].runtimeAccumUs += taskDelta100ms;
 
         BaseType_t affinity = getSafeAffinity(statusArray[j].xHandle);
@@ -994,7 +982,6 @@ void updateTaskMonitoring() {
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].prevTotalRuntime100ms = coreRuntime[c].totalRuntime100ms;
   }
-  prevNoAffinityRuntime100ms = noAffinityRuntime100ms;
 }
 
 // ============================================================================
@@ -1064,9 +1051,11 @@ void sendDebugInfo() {
 
   doc["num_tasks"] = taskCount;
 
+
   JsonObject cpu = doc.createNestedObject("cpu_load");
   cpu["core0_percent"] = coreLoadPct[0];
   cpu["core1_percent"] = coreLoadPct[1];
+
 
   JsonObject coresDetail = doc.createNestedObject("cores_detail");
   for (int c = 0; c < NUM_CORES; c++) {
@@ -1703,9 +1692,6 @@ void setup() {
     coreRuntime[c].taskCount = 0;
     coreRuntime[c].cpuPercentTotal = 0;
   }
-
-  // Calibrate CPU load monitor (3 second delay)
-  startCpuLoadMonitor();
 
   // Create RTOS tasks
 #if NUM_CORES > 1
