@@ -1,18 +1,14 @@
 /*
-  Universal ESP32(x) Template - PER-CORE ISOLATION
-  ESP-IDF 5.1 Compatible
-    Features:
-  - Per-core runtime tracking with separate monitoring for each core
-  - Task affinity detection using xTaskGetAffinity()
-  - Per-core CPU percentage calculation relative to each core's runtime
-  - Architecture-aware: Handles single-core (C3/C6/S2) and dual-core (ESP32/S3)
-  - BLE configuration and control (where available)
-  - Wi-Fi with DHCP/static IP
-  - HTTP API + dashboard
-  - Message pool (no malloc in hot path)
+  ESP32(x) Per-Core Monitor Template
+  Features: Per-core CPU tracking, BLE control, WiFi config, Task monitoring
 */
-// ===== DEBUG MODE FLAG =====
+
 #define DEBUG_MODE 1
+
+// FreeRTOS runtime stats configuration
+#ifndef CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
+#define CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS 1
+#endif
 #ifndef CONFIG_FREERTOS_USE_CUSTOM_RUN_TIME_STATS_HOOKS
 #define CONFIG_FREERTOS_USE_CUSTOM_RUN_TIME_STATS_HOOKS 1
 #endif
@@ -22,14 +18,9 @@
 #ifndef CONFIG_FREERTOS_USE_TRACE_FACILITY
 #define CONFIG_FREERTOS_USE_TRACE_FACILITY 1
 #endif
-#ifndef CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
-#define CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS 1
-#endif
 
-// Override FreeRTOS port macros to use custom run time stats
 #define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS configureTimerForRunTimeStats
 #define portGET_RUN_TIME_COUNTER_VALUE ulGetRunTimeCounterValue
-#define portALT_GET_RUN_TIME_COUNTER_VALUE ulGetRunTimeCounterValue
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -43,47 +34,45 @@
 #include <esp_wifi.h>
 #include <esp_timer.h>
 #include <esp_log.h>
-#include <math.h>
 #include <pgmspace.h>
-// ===== target family detection =====
+
+// Target chip detection
 #if defined(CONFIG_IDF_TARGET_ESP32)
-#define RNGDS_HAS_BLE 1
-#define RNGDS_HAS_TEMP 0
+#define ESP32_HAS_BLE 1
+#define BLE_ADVERT_NAME "RNGDS_ESP32"
+#define ESP32_HAS_TEMP 0
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
-#define RNGDS_HAS_BLE 1
-#define RNGDS_HAS_TEMP 1
+#define ESP32_HAS_BLE 1
+#define BLE_ADVERT_NAME "RNGDS_ESP32S3"
+#define ESP32_HAS_TEMP 1
 #include "driver/temperature_sensor.h"
 #elif defined(CONFIG_IDF_TARGET_ESP32C3)
-#define RNGDS_HAS_BLE 1
-#define RNGDS_HAS_TEMP 1
+#define ESP32_HAS_BLE 1
+#define BLE_ADVERT_NAME "RNGDS_ESP32C3"
+#define ESP32_HAS_TEMP 1
 #include "driver/temperature_sensor.h"
 #elif defined(CONFIG_IDF_TARGET_ESP32C6)
-#define RNGDS_HAS_BLE 1
-#define RNGDS_HAS_TEMP 1
+#define ESP32_HAS_BLE 1
+#define BLE_ADVERT_NAME "RNGDS_ESP32C6"
+#define ESP32_HAS_TEMP 1
 #include "driver/temperature_sensor.h"
 #elif defined(CONFIG_IDF_TARGET_ESP32S2)
-#define RNGDS_HAS_BLE 0
-#define RNGDS_HAS_TEMP 1
+#define ESP32_HAS_BLE 0
+#define ESP32_HAS_TEMP 1
 #include "driver/temperature_sensor.h"
 #else
-#define RNGDS_HAS_BLE 1
-#define RNGDS_HAS_TEMP 0
+#define ESP32_HAS_BLE 1
+#define BLE_ADVERT_NAME "RNGDS"
+#define ESP32_HAS_TEMP 0
 #endif
-// ===== Universal Serial Port =====
-// Define a single 'HWSerial' object to handle USB-CDC (Serial0) vs UART (Serial)
-//#if ARDUINO_USB_CDC_ON_BOOT
-// For chips with native USB (S2, S3, C3, C6)
-//#define HWSerial Serial0
-//#else
-// For chips with external USB-UART (classic ESP32)
-#define HWSerial Serial
-//#endif
-#if RNGDS_HAS_BLE
+
+#if ESP32_HAS_BLE
 #include <NimBLEDevice.h>
 #include <NimBLEServer.h>
 #include <NimBLEUtils.h>
 #endif
-// ===== message pool config =====
+
+// Message pool for zero-malloc execution
 #define MSG_POOL_SIZE 10
 #define MAX_MSG_SIZE 256
 struct ExecMessage {
@@ -91,17 +80,15 @@ struct ExecMessage {
   uint16_t length;
   bool inUse;
 };
-// ===== runtime stats source for FreeRTOS =====
-// 64-bit version: true microsecond precision, ~584 000 years before wrap
-// Replace below if you want ultra-long drift-free tracking
 
-// ===== CPU load metering (declare before functions that use them) =====
+// CPU load monitoring (declare early for use in callbacks)
 volatile uint32_t idleCnt[2] = { 0, 0 };
 volatile uint32_t idleCal[2] = { 1, 1 };
 volatile uint32_t lastIdle[2] = { 0, 0 };
 volatile uint8_t coreLoadPct[2] = { 0, 0 };
 uint32_t lastLoadTs = 0;
 
+// FreeRTOS runtime counter (microsecond resolution, 584k year wrap time)
 static uint64_t runtimeOffsetUs = 0;
 
 extern "C" void configureTimerForRunTimeStats(void) {
@@ -109,18 +96,17 @@ extern "C" void configureTimerForRunTimeStats(void) {
 }
 
 extern "C" uint64_t ulGetRunTimeCounterValue(void) {
-  return (esp_timer_get_time() - runtimeOffsetUs);  // µs resolution
+  return (esp_timer_get_time() - runtimeOffsetUs);
 }
-#define portGET_RUN_TIME_COUNTER_VALUE ulGetRunTimeCounterValue
-#define portALT_GET_RUN_TIME_COUNTER_VALUE ulGetRunTimeCounterValue
 
-// ===== system configuration =====
+// System configuration
 #define WDT_TIMEOUT 20
 #define MAX_BLE_CMD_LENGTH 256
 #define STACK_CHECK_INTERVAL 60000
 #define WIFI_RECONNECT_DELAY 15000
 #define WIFI_CONNECT_TIMEOUT 30000
-// ===== board LED per family =====
+
+// Board-specific LED pins
 #if defined(CONFIG_IDF_TARGET_ESP32C3)
 #define BLE_LED_PIN 8
 #elif defined(CONFIG_IDF_TARGET_ESP32C6)
@@ -133,23 +119,28 @@ extern "C" uint64_t ulGetRunTimeCounterValue(void) {
 #define BLE_LED_PIN 2
 #endif
 #define BLE_LED_BLINK_MS 500
-// ===== core count helper =====
+
+// Core count
 #if CONFIG_FREERTOS_UNICORE
 #define NUM_CORES 1
 #else
 #define NUM_CORES 2
 #endif
-// ===== BLE profile =====
+
+// BLE UUIDs
 static const char* BLE_SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 static const char* BLE_CHAR_UUID_RX = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
 static const char* BLE_CHAR_UUID_TX = "beb5483e-36e1-4688-b7f5-ea07361b26a9";
-#if RNGDS_HAS_BLE
+
+#if ESP32_HAS_BLE
 NimBLEServer* pBLEServer = nullptr;
 NimBLECharacteristic* pTxCharacteristic = nullptr;
 #endif
+
 bool bleDeviceConnected = false;
 bool bleOldDeviceConnected = false;
-// ===== persistent network config in NVS =====
+
+// Network configuration stored in NVS
 struct {
   bool useDHCP;
   IPAddress staticIP;
@@ -163,9 +154,11 @@ struct {
   IPAddress(255, 255, 255, 0),
   IPAddress(8, 8, 8, 8)
 };
+
 WebServer server(80);
 Preferences prefs;
-// ===== task monitoring WITH PER-CORE AWARENESS =====
+
+// Per-task monitoring data
 #define MAX_TASKS_MONITORED 64
 struct TaskMonitorData {
   String name;
@@ -173,43 +166,36 @@ struct TaskMonitorData {
   eTaskState state;
   uint32_t runtime;
   uint32_t prevRuntime;
-  uint64_t runtimeAccumUs;  // 64-bit wrap-free accumulator of task runtime in microseconds
+  uint64_t runtimeAccumUs;
   uint32_t stackHighWater;
-  uint8_t cpuPercent;  // Per-core aware instantaneous CPU%
+  uint8_t cpuPercent;
   String stackHealth;
-  BaseType_t coreAffinity;  // tskNO_AFFINITY, 0, or 1
-  TaskHandle_t handle;      // Store handle for affinity queries
+  BaseType_t coreAffinity;
+  TaskHandle_t handle;
 };
+
 TaskMonitorData taskData[MAX_TASKS_MONITORED];
-uint32_t lastTotalRuntime100ms = 0;
 uint8_t taskCount = 0;
 uint32_t lastTaskSample = 0;
 bool statsInitialized = false;
-// ===== PER-CORE runtime tracking =====
+
+// Per-core runtime tracking
 struct CoreRuntimeData {
-  uint64_t totalRuntime100ms;      // Total runtime for this core
-  uint64_t prevTotalRuntime100ms;  // Previous sample
-  uint8_t taskCount;               // Number of tasks pinned to this core
-  uint8_t cpuPercentTotal;         // Sum of all task CPU% (should be ~100%)
+  uint64_t totalRuntime100ms;
+  uint64_t prevTotalRuntime100ms;
+  uint8_t taskCount;
+  uint8_t cpuPercentTotal;
 };
-CoreRuntimeData coreRuntime[2];       // Index 0 = Core 0, Index 1 = Core 1
-uint64_t noAffinityRuntime100ms = 0;  // Tasks with no affinity
+
+CoreRuntimeData coreRuntime[2];
+uint64_t noAffinityRuntime100ms = 0;
 uint64_t prevNoAffinityRuntime100ms = 0;
-// Long-term wrap-free accumulators (microseconds)
+uint64_t noAffinityAccumUs = 0;  
 uint64_t coreAccumUs[2] = { 0, 0 };
-uint64_t noAffinityAccumUs = 0;
-// ISR/Overhead accounting
-uint64_t isrOverheadAccumUs = 0;  // accumulated time not accounted to any task
-uint64_t lastSampleWallUs = 0;    // last sample timestamp (esp_timer_get_time)
-
-
-
-
+uint64_t lastSampleWallUs = 0;
 uint32_t lastStackCheck = 0;
-// ===== heap tracking =====
-uint32_t lastHeapCheck = 0;
-uint32_t minHeapEver = UINT32_MAX;
-// ===== business logic structures =====
+
+// Business logic
 enum BizState : uint8_t { BIZ_STOPPED = 0,
                           BIZ_RUNNING = 1 };
 volatile BizState gBizState = BIZ_STOPPED;
@@ -218,26 +204,29 @@ volatile uint32_t bizProcessed = 0;
 TaskHandle_t webTaskHandle = nullptr;
 TaskHandle_t bizTaskHandle = nullptr;
 TaskHandle_t sysTaskHandle = nullptr;
-// ===== Wi-Fi state machine =====
+
+// WiFi state machine
 enum WiFiState : uint8_t {
   WIFI_STATE_IDLE = 0,
   WIFI_STATE_CONNECTING,
   WIFI_STATE_CONNECTED,
   WIFI_STATE_DISCONNECTED
 };
+
 volatile WiFiState wifiState = WIFI_STATE_IDLE;
 uint32_t wifiLastConnectAttempt = 0;
 bool wifiManualDisconnect = false;
 uint8_t wifiReconnectAttempts = 0;
 const uint8_t MAX_WIFI_RECONNECT_ATTEMPTS = 10;
-// ===== temperature handle (IDF temp sensor) =====
-#if RNGDS_HAS_TEMP
+
+#if ESP32_HAS_TEMP
 static temperature_sensor_handle_t s_temp_sensor = NULL;
 #endif
-// ===== message pool =====
+
 ExecMessage msgPool[MSG_POOL_SIZE];
 SemaphoreHandle_t poolMutex = nullptr;
-// ===== forward declarations =====
+
+// Forward declarations
 void handleBLECommand(String cmd);
 void setupWiFi();
 void checkWiFiConnection();
@@ -249,9 +238,11 @@ void systemTask(void* param);
 void webTask(void* param);
 void bizTask(void* param);
 static void handleApiStatus();
+
 // ============================================================================
-// message pool
+// Message Pool (zero-malloc message handling)
 // ============================================================================
+
 void initMessagePool() {
   poolMutex = xSemaphoreCreateMutex();
   for (int i = 0; i < MSG_POOL_SIZE; i++) {
@@ -259,6 +250,7 @@ void initMessagePool() {
     msgPool[i].length = 0;
   }
 }
+
 ExecMessage* allocMessage() {
   if (xSemaphoreTake(poolMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     for (int i = 0; i < MSG_POOL_SIZE; i++) {
@@ -272,6 +264,7 @@ ExecMessage* allocMessage() {
   }
   return nullptr;
 }
+
 void freeMessage(ExecMessage* msg) {
   if (msg && xSemaphoreTake(poolMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     msg->inUse = false;
@@ -279,39 +272,28 @@ void freeMessage(ExecMessage* msg) {
     xSemaphoreGive(poolMutex);
   }
 }
+
 // ============================================================================
-// Timing Utilities
-// ============================================================================
-inline uint64_t micros64() {
-  return (uint64_t)esp_timer_get_time();
-}
-inline float usToSec(uint64_t us) {
-  return (float)us / 1e6f;
-}
-inline float usToMs(uint64_t us) {
-  return (float)us / 1000.0f;
-}
-// ============================================================================
-// idle hooks -> raw idle counters per core
+// CPU Load Monitoring
 // ============================================================================
 extern "C" bool idleHook0() {
   idleCnt[0]++;
   return true;
 }
+
 #if NUM_CORES > 1
 extern "C" bool idleHook1() {
   idleCnt[1]++;
   return true;
 }
 #endif
-// ============================================================================
-// CPU load calibration + periodic load calc
-// ============================================================================
+
 void startCpuLoadMonitor() {
   esp_register_freertos_idle_hook_for_cpu(idleHook0, 0);
 #if NUM_CORES > 1
   esp_register_freertos_idle_hook_for_cpu(idleHook1, 1);
 #endif
+
   uint32_t s0[2] = { idleCnt[0], idleCnt[1] };
   uint64_t t0 = esp_timer_get_time();
   delay(3000);
@@ -319,98 +301,78 @@ void startCpuLoadMonitor() {
   uint32_t d0 = idleCnt[0] - s0[0];
   uint32_t d1 = (NUM_CORES > 1) ? (idleCnt[1] - s0[1]) : 1;
   uint32_t elapsedMs = (t1 - t0) / 1000;
+
   idleCal[0] = max(1UL, (uint32_t)((float)d0 * (1000.0f / elapsedMs)));
   idleCal[1] = max(1UL, (uint32_t)((float)d1 * (1000.0f / elapsedMs)));
   lastIdle[0] = idleCnt[0];
   lastIdle[1] = idleCnt[1];
   lastLoadTs = millis();
-
-  // FIX: Seed integrator to current uptime to avoid startup drift
-  uint64_t currentUptimeUs = esp_timer_get_time();
 }
+
 void updateCpuLoad() {
   uint32_t now = millis();
   if (now - lastLoadTs < 1000) return;
+
   uint32_t elapsed = now - lastLoadTs;
   lastLoadTs = now;
+
   for (int c = 0; c < NUM_CORES; c++) {
     uint32_t di = idleCnt[c] - lastIdle[c];
     lastIdle[c] = idleCnt[c];
     float ratio = (float)(di * (1000.0f / elapsed)) / idleCal[c];
-    if (ratio > 1.0f) ratio = 1.0f;
-    if (ratio < 0.0f) ratio = 0.0f;
+    ratio = constrain(ratio, 0.0f, 1.0f);
     uint8_t newLoad = (uint8_t)(100.0f * (1.0f - ratio) + 0.5f);
-    coreLoadPct[c] = (coreLoadPct[c] + newLoad) / 2;  // less smoothing (EMA 1/2)
+    coreLoadPct[c] = (coreLoadPct[c] + newLoad) / 2;
   }
 }
+
 // ============================================================================
-// heap + stack checks
+// Health Monitoring
 // ============================================================================
-void monitorHeapHealth() {
-  uint32_t now = millis();
-  if (now - lastHeapCheck < 60000) return;
-  lastHeapCheck = now;
-  uint32_t currentFree = ESP.getFreeHeap();
-  uint32_t minFree = ESP.getMinFreeHeap();
-  if (minFree < minHeapEver) {
-    minHeapEver = minFree;
-  }
-#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C6) || defined(CONFIG_IDF_TARGET_ESP32S2)
-  if (currentFree < 10000) {
-  }
-#else
-  if (currentFree < 20000) {
-  }
-#endif
-}
+
 void checkTaskStacks() {
   uint32_t now = millis();
   if (now - lastStackCheck < STACK_CHECK_INTERVAL) return;
   lastStackCheck = now;
-  if (webTaskHandle) {
-    UBaseType_t w = uxTaskGetStackHighWaterMark(webTaskHandle);
-    if (w < 512) {
-    }
-  }
-  if (bizTaskHandle) {
-    UBaseType_t w = uxTaskGetStackHighWaterMark(bizTaskHandle);
-    if (w < 512) {
-    }
-  }
-  if (sysTaskHandle) {
-    UBaseType_t w = uxTaskGetStackHighWaterMark(sysTaskHandle);
-    if (w < 512) {
-    }
-  }
+
+  if (webTaskHandle) uxTaskGetStackHighWaterMark(webTaskHandle);
+  if (bizTaskHandle) uxTaskGetStackHighWaterMark(bizTaskHandle);
+  if (sysTaskHandle) uxTaskGetStackHighWaterMark(sysTaskHandle);
 }
+
 // ============================================================================
-// small string helpers
+// String Helpers
 // ============================================================================
+
 String cleanString(const String& input) {
   if (input.length() == 0) return String();
   const char* str = input.c_str();
   int len = input.length();
-  int start = 0;
-  int end = len - 1;
+  int start = 0, end = len - 1;
+
   while (start < len && isspace((unsigned char)str[start])) start++;
   while (end >= start && isspace((unsigned char)str[end])) end--;
-  if (start > end) return String();
-  return input.substring(start, end + 1);
+
+  return (start > end) ? String() : input.substring(start, end + 1);
 }
+
 bool isValidIP(const String& s) {
   IPAddress ip;
   if (!ip.fromString(s)) return false;
   return !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
 }
+
 bool isValidSubnet(const String& s) {
   IPAddress sub;
   if (!sub.fromString(s)) return false;
   uint32_t m = ~(uint32_t)sub;
   return (m & (m + 1)) == 0;
 }
+
 IPAddress parseIP(const String& s) {
   IPAddress ip;
   if (ip.fromString(s)) return ip;
+
   int p[4] = { 0 };
   int idx = 0, st = 0;
   for (int i = 0; i <= s.length() && idx < 4; i++) {
@@ -421,13 +383,16 @@ IPAddress parseIP(const String& s) {
   }
   return IPAddress(p[0], p[1], p[2], p[3]);
 }
+
 // ============================================================================
-// NVS helpers
+// NVS Storage
 // ============================================================================
+
 void saveWiFi(const String& s, const String& p) {
   prefs.putString("wifi_ssid", s);
   prefs.putString("wifi_pass", p);
 }
+
 void saveNetworkConfig() {
   prefs.putBool("use_dhcp", netConfig.useDHCP);
   prefs.putUInt("static_ip", (uint32_t)netConfig.staticIP);
@@ -435,6 +400,7 @@ void saveNetworkConfig() {
   prefs.putUInt("subnet", (uint32_t)netConfig.subnet);
   prefs.putUInt("dns", (uint32_t)netConfig.dns);
 }
+
 void loadNetworkConfig() {
   netConfig.useDHCP = prefs.getBool("use_dhcp", true);
   netConfig.staticIP = prefs.getUInt("static_ip", (uint32_t)IPAddress(192, 168, 1, 100));
@@ -442,35 +408,39 @@ void loadNetworkConfig() {
   netConfig.subnet = prefs.getUInt("subnet", (uint32_t)IPAddress(255, 255, 255, 0));
   netConfig.dns = prefs.getUInt("dns", (uint32_t)IPAddress(8, 8, 8, 8));
 }
+
 // ============================================================================
-// temperature helper
+// Temperature Sensor
 // ============================================================================
+
 float getInternalTemperatureC() {
-#if RNGDS_HAS_TEMP
+#if ESP32_HAS_TEMP
   if (s_temp_sensor == NULL) return NAN;
   float tsens_out;
   if (temperature_sensor_get_celsius(s_temp_sensor, &tsens_out) == ESP_OK) {
     return tsens_out;
   }
-  return NAN;
-#else
-  return NAN;
 #endif
+  return NAN;
 }
+
 // ============================================================================
-// BLE send (notify) or stub
+// BLE Functions
 // ============================================================================
+
 void sendBLE(const String& m) {
-#if RNGDS_HAS_BLE
+#if ESP32_HAS_BLE
   if (!bleDeviceConnected || !pTxCharacteristic) return;
+
   const char* data = m.c_str();
   size_t len = m.length();
+
   if (len <= 512) {
     pTxCharacteristic->setValue((uint8_t*)data, len);
     pTxCharacteristic->notify();
   } else {
     for (size_t i = 0; i < len; i += 512) {
-      size_t chunk_size = (len - i > 512) ? 512 : (len - i);
+      size_t chunk_size = (len - i > 512) ? 512 : (len - i);  // FIXED
       pTxCharacteristic->setValue((uint8_t*)(data + i), chunk_size);
       pTxCharacteristic->notify();
       delay(20);
@@ -480,44 +450,50 @@ void sendBLE(const String& m) {
   (void)m;
 #endif
 }
-// ============================================================================
-// BLE init + RX handling
-// ============================================================================
-#if RNGDS_HAS_BLE
+
+#if ESP32_HAS_BLE
+
 class MyServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     bleDeviceConnected = true;
     NimBLEDevice::getAdvertising()->stop();
     pServer->updateConnParams(connInfo.getConnHandle(), 30, 60, 0, 400);
   }
+
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     bleDeviceConnected = false;
   }
 };
+
 class BLECommandBuffer {
 private:
   char buffer[MAX_BLE_CMD_LENGTH];
   size_t pos;
+
 public:
   BLECommandBuffer()
     : pos(0) {
     buffer[0] = '\0';
   }
+
   void append(const uint8_t* data, size_t len) {
     size_t available = MAX_BLE_CMD_LENGTH - pos - 1;
-    size_t to_copy = (len < available) ? len : available;
+    size_t to_copy = min(len, available);
     if (to_copy > 0) {
       memcpy(buffer + pos, data, to_copy);
       pos += to_copy;
       buffer[pos] = '\0';
     }
   }
+
   bool hasComplete() const {
     return strchr(buffer, '\n') != nullptr;
   }
+
   String extractCommand() {
     char* newline = strchr(buffer, '\n');
     if (!newline) return String();
+
     *newline = '\0';
     String cmd(buffer);
     size_t remaining = pos - (newline - buffer + 1);
@@ -529,7 +505,9 @@ public:
     return cmd;
   }
 };
+
 static BLECommandBuffer cmdBuffer;
+
 class MyCharCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     std::string value = pChar->getValue();
@@ -545,32 +523,38 @@ class MyCharCallbacks : public NimBLECharacteristicCallbacks {
     }
   }
 };
+
 void initBLE() {
-  NimBLEDevice::init("RNGDS_ESP32x");
+  NimBLEDevice::init(BLE_ADVERT_NAME);
   NimBLEDevice::setMTU(256);
+
   pBLEServer = NimBLEDevice::createServer();
   pBLEServer->setCallbacks(new MyServerCallbacks());
+
   NimBLEService* pService = pBLEServer->createService(BLE_SERVICE_UUID);
-  pTxCharacteristic = pService->createCharacteristic(
-    BLE_CHAR_UUID_TX,
-    NIMBLE_PROPERTY::NOTIFY);
+  pTxCharacteristic = pService->createCharacteristic(BLE_CHAR_UUID_TX, NIMBLE_PROPERTY::NOTIFY);
+
   NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
-    BLE_CHAR_UUID_RX,
-    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    BLE_CHAR_UUID_RX, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   pRxCharacteristic->setCallbacks(new MyCharCallbacks());
+
   pService->start();
+
   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(BLE_SERVICE_UUID);
   NimBLEAdvertisementData advData;
-  advData.setName("RNGDS");
+  advData.setName(BLE_ADVERT_NAME);
   advData.addServiceUUID(BLE_SERVICE_UUID);
   pAdvertising->setAdvertisementData(advData);
+
   NimBLEAdvertisementData scanData;
-  scanData.setName("RNGDS");
+  scanData.setName(BLE_ADVERT_NAME);
   pAdvertising->setScanResponseData(scanData);
+
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   pAdvertising->start();
 }
+
 void handleBLEReconnect() {
   if (!bleDeviceConnected && bleOldDeviceConnected) {
     delay(500);
@@ -581,14 +565,12 @@ void handleBLEReconnect() {
     bleOldDeviceConnected = bleDeviceConnected;
   }
 }
+
 #else
-void initBLE() {
-}
+void initBLE() {}
 void handleBLEReconnect() {}
 #endif
-// ============================================================================
-// BLE command handler
-// ============================================================================
+
 void handleBLECommand(String cmd) {
   cmd = cleanString(cmd);
   cmd.trim();
@@ -596,6 +578,7 @@ void handleBLECommand(String cmd) {
   upper.toUpperCase();
   String response;
   response.reserve(128);
+
   if (upper.startsWith("SET_WIFI|") || upper.startsWith("WIFI:")) {
     String ssid, pass;
     if (upper.startsWith("SET_WIFI|")) {
@@ -619,24 +602,27 @@ void handleBLECommand(String cmd) {
         return;
       }
     }
+
     saveWiFi(ssid, pass);
     wifiManualDisconnect = false;
     wifiReconnectAttempts = 0;
     wifiState = WIFI_STATE_IDLE;
     sendBLE("OK:WIFI_SAVED\n");
+
     WiFi.disconnect(true, true);
     delay(500);
     WiFi.mode(WIFI_OFF);
     delay(500);
     WiFi.mode(WIFI_STA);
     delay(100);
+
     if (!netConfig.useDHCP) {
-      WiFi.config(netConfig.staticIP, netConfig.gateway,
-                  netConfig.subnet, netConfig.dns);
+      WiFi.config(netConfig.staticIP, netConfig.gateway, netConfig.subnet, netConfig.dns);
     }
     WiFi.begin(ssid.c_str(), pass.c_str());
     wifiState = WIFI_STATE_CONNECTING;
     wifiLastConnectAttempt = millis();
+
   } else if (upper.startsWith("SET_IP|")) {
     String rest = cmd.substring(7);
     if (rest.equalsIgnoreCase("DHCP")) {
@@ -648,11 +634,13 @@ void handleBLECommand(String cmd) {
       int p1 = rest.indexOf('|');
       int p2 = rest.indexOf('|', p1 + 1);
       int p3 = rest.indexOf('|', p2 + 1);
+
       if (p1 > 0 && p2 > 0 && p3 > 0) {
         String ip = rest.substring(0, p1);
         String gw = rest.substring(p1 + 1, p2);
         String sub = rest.substring(p2 + 1, p3);
         String dns = rest.substring(p3 + 1);
+
         if (isValidIP(ip) && isValidIP(gw)) {
           netConfig.staticIP = parseIP(ip);
           netConfig.gateway = parseIP(gw);
@@ -670,30 +658,30 @@ void handleBLECommand(String cmd) {
     } else {
       sendBLE("ERR:FORMAT\n");
     }
+
   } else if (upper == "GET_STATUS" || upper == "STATUS") {
     bool connected = (WiFi.status() == WL_CONNECTED);
     response = "STATUS|";
     response += connected ? "CONNECTED" : "DISCONNECTED";
-    response += "|";
-    response += WiFi.SSID();
-    response += "|";
+    response += "|" + WiFi.SSID() + "|";
     response += connected ? WiFi.localIP().toString() : "-";
     response += "|";
     response += connected ? String(WiFi.RSSI()) : "-";
     response += "|";
     response += netConfig.useDHCP ? "DHCP" : "STATIC";
     if (!netConfig.useDHCP) {
-      response += "|";
-      response += netConfig.staticIP.toString();
+      response += "|" + netConfig.staticIP.toString();
     }
     response += "\n";
     sendBLE(response);
+
   } else if (upper == "DISCONNECT_WIFI" || upper == "DISCONNECT") {
     WiFi.disconnect(true, true);
     delay(200);
     wifiManualDisconnect = true;
     wifiState = WIFI_STATE_DISCONNECTED;
     sendBLE("OK:WIFI_DISCONNECTED\n");
+
   } else if (upper == "CLEAR_SAVED" || upper == "CLEAR_WIFI") {
     prefs.remove("wifi_ssid");
     prefs.remove("wifi_pass");
@@ -702,19 +690,18 @@ void handleBLECommand(String cmd) {
     wifiManualDisconnect = true;
     wifiState = WIFI_STATE_IDLE;
     sendBLE("OK:WIFI_CLEARED\n");
+
   } else if (upper == "RESTART") {
     sendBLE("OK:RESTARTING\n");
     delay(150);
     ESP.restart();
+
   } else if (upper == "HEAP") {
-    response = "HEAP:FREE=";
-    response += String(ESP.getFreeHeap());
-    response += "|MIN=";
-    response += String(ESP.getMinFreeHeap());
-    response += "|MAX=";
-    response += String(ESP.getMaxAllocHeap());
-    response += "\n";
+    response = "HEAP:FREE=" + String(ESP.getFreeHeap());
+    response += "|MIN=" + String(ESP.getMinFreeHeap());
+    response += "|MAX=" + String(ESP.getMaxAllocHeap()) + "\n";
     sendBLE(response);
+
   } else if (upper == "TEMP") {
     float t = getInternalTemperatureC();
     if (isnan(t)) {
@@ -722,28 +709,29 @@ void handleBLECommand(String cmd) {
     } else {
       sendBLE("TEMP:" + String(t, 2) + "\n");
     }
+
   } else {
     sendBLE("ERR:UNKNOWN_CMD\n");
   }
 }
+
 // ============================================================================
-// Wi-Fi bringup + state machine
+// WiFi Management
 // ============================================================================
+
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);
   WiFi.setSleep(false);
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
+
   String ssid = prefs.getString("wifi_ssid", "");
   String pass = prefs.getString("wifi_pass", "");
-  if (ssid.length() == 0) {
-    return;
-  }
+  if (ssid.length() == 0) return;
+
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
       case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-        wifiState = WIFI_STATE_CONNECTED;
-        break;
       case ARDUINO_EVENT_WIFI_STA_GOT_IP:
         wifiState = WIFI_STATE_CONNECTED;
         break;
@@ -756,68 +744,68 @@ void setupWiFi() {
         break;
     }
   });
+
   if (!netConfig.useDHCP) {
     WiFi.config(netConfig.staticIP, netConfig.gateway, netConfig.subnet, netConfig.dns);
-  } else {
   }
+
   WiFi.begin(ssid.c_str(), pass.c_str());
   wifiState = WIFI_STATE_CONNECTING;
   wifiLastConnectAttempt = millis();
   wifiReconnectAttempts = 1;
 }
+
 void checkWiFiConnection() {
   if (wifiManualDisconnect) return;
+
   uint32_t now = millis();
   wl_status_t status = WiFi.status();
+
   switch (wifiState) {
     case WIFI_STATE_IDLE:
-      {
-        if (prefs.getString("wifi_ssid", "").length() > 0) {
-          if (wifiReconnectAttempts >= MAX_WIFI_RECONNECT_ATTEMPTS) {
-            wifiManualDisconnect = true;
-            return;
-          }
-          wifiState = WIFI_STATE_CONNECTING;
-          wifiLastConnectAttempt = now;
-          String ssid = prefs.getString("wifi_ssid", "");
-          String pass = prefs.getString("wifi_pass", "");
-          WiFi.begin(ssid.c_str(), pass.c_str());
-          wifiReconnectAttempts++;
+      if (prefs.getString("wifi_ssid", "").length() > 0) {
+        if (wifiReconnectAttempts >= MAX_WIFI_RECONNECT_ATTEMPTS) {
+          wifiManualDisconnect = true;
+          return;
         }
+        wifiState = WIFI_STATE_CONNECTING;
+        wifiLastConnectAttempt = now;
+        String ssid = prefs.getString("wifi_ssid", "");
+        String pass = prefs.getString("wifi_pass", "");
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        wifiReconnectAttempts++;
       }
       break;
-    case WIFI_STATE_CONNECTING:
-      {
-        if (status == WL_CONNECTED) {
-          wifiState = WIFI_STATE_CONNECTED;
-          wifiReconnectAttempts = 0;
 
-        } else if (now - wifiLastConnectAttempt > WIFI_CONNECT_TIMEOUT) {
-          wifiState = WIFI_STATE_DISCONNECTED;
-        }
+    case WIFI_STATE_CONNECTING:
+      if (status == WL_CONNECTED) {
+        wifiState = WIFI_STATE_CONNECTED;
+        wifiReconnectAttempts = 0;
+      } else if (now - wifiLastConnectAttempt > WIFI_CONNECT_TIMEOUT) {
+        wifiState = WIFI_STATE_DISCONNECTED;
       }
       break;
+
     case WIFI_STATE_CONNECTED:
-      {
-        if (status != WL_CONNECTED) {
-          wifiState = WIFI_STATE_DISCONNECTED;
-        }
+      if (status != WL_CONNECTED) {
+        wifiState = WIFI_STATE_DISCONNECTED;
       }
       break;
+
     case WIFI_STATE_DISCONNECTED:
-      {
-        uint8_t maxShift = (wifiReconnectAttempts < 4) ? wifiReconnectAttempts : 4;
-        uint32_t backoffDelay = WIFI_RECONNECT_DELAY * (1 << maxShift);
-        if (now - wifiLastConnectAttempt > backoffDelay) {
-          wifiState = WIFI_STATE_IDLE;
-        }
+      uint8_t maxShift = min(wifiReconnectAttempts, (uint8_t)4);
+      uint32_t backoffDelay = WIFI_RECONNECT_DELAY * (1 << maxShift);
+      if (now - wifiLastConnectAttempt > backoffDelay) {
+        wifiState = WIFI_STATE_IDLE;
       }
       break;
   }
 }
+
 // ============================================================================
-// task monitor helpers
+// Task Monitoring Helpers
 // ============================================================================
+
 String getTaskStateName(eTaskState s) {
   switch (s) {
     case eRunning: return "RUNNING";
@@ -828,31 +816,32 @@ String getTaskStateName(eTaskState s) {
     default: return "UNKNOWN";
   }
 }
+
 String getStackHealth(uint32_t hwm) {
   if (hwm > 1500) return "good";
   if (hwm > 800) return "ok";
   if (hwm > 300) return "low";
   return "critical";
 }
+
 String getAffinityString(BaseType_t affinity) {
-  if (affinity == tskNO_AFFINITY) {
-    return "ANY";
-  }
-  return String(affinity);
+  return (affinity == tskNO_AFFINITY) ? "ANY" : String(affinity);
 }
-// Safe affinity getter across single/dual core targets
+
 static inline BaseType_t getSafeAffinity(TaskHandle_t handle) {
 #if CONFIG_FREERTOS_UNICORE
   (void)handle;
-  return 0;  // single-core: treat as core 0
+  return 0;
 #else
   if (handle == nullptr) return tskNO_AFFINITY;
   return xTaskGetAffinity(handle);
 #endif
 }
+
 // ============================================================================
-// PER-CORE Task Monitoring - The Core Algorithm
+// Per-Core Task Monitoring (Main Algorithm)
 // ============================================================================
+
 void updateTaskMonitoring() {
   if (millis() - lastTaskSample < 500) return;
   lastTaskSample = millis();
@@ -860,8 +849,8 @@ void updateTaskMonitoring() {
   uint64_t sampleStartUs = esp_timer_get_time();
   TaskStatus_t statusArray[MAX_TASKS_MONITORED];
   UBaseType_t numTasks = uxTaskGetSystemState(statusArray, MAX_TASKS_MONITORED, NULL);
-
   if (numTasks == 0) return;
+
   // Reset per-core counters
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].totalRuntime100ms = 0;
@@ -869,31 +858,30 @@ void updateTaskMonitoring() {
     coreRuntime[c].cpuPercentTotal = 0;
   }
   noAffinityRuntime100ms = 0;
-  // First pass: Calculate per-core totals using xTaskGetAffinity()
+
+  // Calculate per-core totals
   for (uint8_t j = 0; j < numTasks; j++) {
     BaseType_t affinity = getSafeAffinity(statusArray[j].xHandle);
     uint32_t runtime = statusArray[j].ulRunTimeCounter;
 
     if (affinity == tskNO_AFFINITY) {
-      // Task can migrate between cores
       noAffinityRuntime100ms += (uint64_t)runtime;
     } else if (affinity >= 0 && affinity < NUM_CORES) {
-      // Task pinned to specific core
       coreRuntime[affinity].totalRuntime100ms += (uint64_t)runtime;
       coreRuntime[affinity].taskCount++;
     }
   }
+
   // Calculate per-core deltas
   uint64_t coreDelta[2] = { 0, 0 };
   for (int c = 0; c < NUM_CORES; c++) {
     coreDelta[c] = coreRuntime[c].totalRuntime100ms - coreRuntime[c].prevTotalRuntime100ms;
-    if (coreDelta[c] == 0) coreDelta[c] = 1;  // Avoid division by zero
+    if (coreDelta[c] == 0) coreDelta[c] = 1;
   }
-  uint64_t noAffinityDelta = noAffinityRuntime100ms - prevNoAffinityRuntime100ms;
 
-  // First time init
+  // First time initialization
   if (!statsInitialized) {
-    taskCount = (numTasks > MAX_TASKS_MONITORED) ? MAX_TASKS_MONITORED : numTasks;
+    taskCount = min(numTasks, (UBaseType_t)MAX_TASKS_MONITORED);
     for (uint8_t i = 0; i < taskCount; i++) {
       taskData[i].name = String(statusArray[i].pcTaskName);
       taskData[i].priority = statusArray[i].uxCurrentPriority;
@@ -906,8 +894,6 @@ void updateTaskMonitoring() {
       taskData[i].cpuPercent = 0;
       taskData[i].handle = statusArray[i].xHandle;
       taskData[i].coreAffinity = getSafeAffinity(statusArray[i].xHandle);
-
-      // No seeding of core accumulators at init; accumulate only deltas to avoid double counting
     }
     for (int c = 0; c < NUM_CORES; c++) {
       coreRuntime[c].prevTotalRuntime100ms = coreRuntime[c].totalRuntime100ms;
@@ -916,8 +902,9 @@ void updateTaskMonitoring() {
     statsInitialized = true;
     return;
   }
-  // Update existing tasks with PER-CORE CPU calculation
-  uint64_t sumTaskDeltaUs = 0;  // sum of all task deltas in this window
+
+  // Update existing tasks with per-core CPU calculation
+  uint64_t sumTaskDeltaUs = 0;
   for (uint8_t i = 0; i < taskCount; i++) {
     bool found = false;
     for (uint8_t j = 0; j < numTasks; j++) {
@@ -925,48 +912,42 @@ void updateTaskMonitoring() {
         uint32_t currentRuntime100ms = statusArray[j].ulRunTimeCounter;
         uint64_t taskDelta100ms = (uint64_t)currentRuntime100ms - taskData[i].prevRuntime;
         if (currentRuntime100ms < taskData[i].prevRuntime) {
-          taskDelta100ms += (1ULL << 32);  // Handle single wrap
+          taskDelta100ms += (1ULL << 32);
         }
         sumTaskDeltaUs += taskDelta100ms;
-        // accumulate wrap-free per-task runtime in microseconds
         taskData[i].runtimeAccumUs += taskDelta100ms;
-        // Get task affinity
+
         BaseType_t affinity = getSafeAffinity(statusArray[j].xHandle);
         taskData[i].coreAffinity = affinity;
-        // accumulate per-core totals (wrap-free)
+
         if (affinity == tskNO_AFFINITY) {
           noAffinityAccumUs += taskDelta100ms;
         } else if (affinity >= 0 && affinity < NUM_CORES) {
           coreAccumUs[affinity] += taskDelta100ms;
         }
+
         // Calculate CPU% based on core affinity
         if (affinity == tskNO_AFFINITY) {
-          // Task can run on any core - calculate against total of all cores
           uint64_t totalCoreDelta = 0;
-          for (int c = 0; c < NUM_CORES; c++) {
-            totalCoreDelta += coreDelta[c];
-          }
+          for (int c = 0; c < NUM_CORES; c++) totalCoreDelta += coreDelta[c];
           if (totalCoreDelta > 0) {
             uint64_t percentage = (taskDelta100ms * 100ULL) / totalCoreDelta;
             taskData[i].cpuPercent = (percentage > 100) ? 100 : (uint8_t)percentage;
-
           } else {
             taskData[i].cpuPercent = 0;
           }
         } else if (affinity >= 0 && affinity < NUM_CORES) {
-          // Task pinned to specific core - calculate against that core only
           if (coreDelta[affinity] > 0) {
             uint64_t percentage = (taskDelta100ms * 100ULL) / coreDelta[affinity];
             taskData[i].cpuPercent = (percentage > 100) ? 100 : (uint8_t)percentage;
-
           } else {
             taskData[i].cpuPercent = 0;
           }
           coreRuntime[affinity].cpuPercentTotal += taskData[i].cpuPercent;
-
         } else {
           taskData[i].cpuPercent = 0;
         }
+
         taskData[i].priority = statusArray[j].uxCurrentPriority;
         taskData[i].state = statusArray[j].eCurrentState;
         taskData[i].runtime = currentRuntime100ms;
@@ -983,6 +964,7 @@ void updateTaskMonitoring() {
       taskData[i].state = eDeleted;
     }
   }
+
   // Add new tasks
   for (uint8_t j = 0; j < numTasks && taskCount < MAX_TASKS_MONITORED; j++) {
     bool exists = false;
@@ -1005,41 +987,27 @@ void updateTaskMonitoring() {
       taskData[taskCount].handle = statusArray[j].xHandle;
       taskData[taskCount].coreAffinity = getSafeAffinity(statusArray[j].xHandle);
       taskCount++;
-
-      // No seeding at add; we accumulate only per-sample deltas
     }
   }
+
   // Store totals for next sample
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].prevTotalRuntime100ms = coreRuntime[c].totalRuntime100ms;
   }
   prevNoAffinityRuntime100ms = noAffinityRuntime100ms;
-
-
-  // ISR/overhead: anything not accounted to tasks in this window
-  if (lastSampleWallUs != 0) {
-    uint64_t wallDeltaUsAllCores = (sampleStartUs - lastSampleWallUs) * (uint64_t)NUM_CORES;
-    uint64_t overheadDeltaUs = (wallDeltaUsAllCores > sumTaskDeltaUs) ? (wallDeltaUsAllCores - sumTaskDeltaUs) : 0;
-    isrOverheadAccumUs += overheadDeltaUs;
-  }
-  lastSampleWallUs = sampleStartUs;
 }
 
+// ============================================================================
+// API Endpoints
+// ============================================================================
 
-
-// ============================================================================
-// Focused Runtime Metrics Serial Output
-// ============================================================================
-static uint32_t lastRuntimePrintMs = 0;
-
-// ============================================================================
-// API endpoints
-// ============================================================================
 static void handleApiStatus() {
   DynamicJsonDocument doc(1536);
   doc["ble"] = bleDeviceConnected;
+
   bool connected = (WiFi.status() == WL_CONNECTED);
   doc["connected"] = connected;
+
   if (connected) {
     doc["ip"] = WiFi.localIP().toString();
     doc["rssi"] = WiFi.RSSI();
@@ -1053,10 +1021,10 @@ static void handleApiStatus() {
       net["dns"] = netConfig.dns.toString();
     }
   }
+
   doc["uptime_ms"] = millis();
   doc["heap_free"] = ESP.getFreeHeap();
   doc["heap_total"] = ESP.getHeapSize();
-  doc["heap_min"] = ESP.getMinFreeHeap();
   doc["heap_max_alloc"] = ESP.getMaxAllocHeap();
   doc["core0_load"] = coreLoadPct[0];
   doc["core1_load"] = coreLoadPct[1];
@@ -1064,13 +1032,13 @@ static void handleApiStatus() {
   doc["cpu_freq"] = ESP.getCpuFreqMHz();
   doc["flash_size"] = ESP.getFlashChipSize() / (1024 * 1024);
   doc["num_cores"] = NUM_CORES;
-  float t = getInternalTemperatureC();
-  if (!isnan(t)) doc["temp_c"] = t;
-  else doc["temp_c"] = nullptr;
+  doc["temp_c"] = getInternalTemperatureC();
+
   JsonObject biz = doc.createNestedObject("biz");
   biz["running"] = (gBizState == BIZ_RUNNING);
   if (execQ) biz["queue"] = uxQueueMessagesWaiting(execQ);
   biz["processed"] = bizProcessed;
+
   JsonObject cores = doc.createNestedObject("cores");
   for (int c = 0; c < NUM_CORES; c++) {
     JsonObject core = cores.createNestedObject(String(c));
@@ -1078,26 +1046,24 @@ static void handleApiStatus() {
     core["load_pct"] = coreLoadPct[c];
     core["cpu_total"] = coreRuntime[c].cpuPercentTotal;
   }
+
   String output;
   output.reserve(1024);
   serializeJson(doc, output);
   server.send(200, "application/json", output);
 }
+
 void sendDebugInfo() {
   DynamicJsonDocument doc(4096);
-  uint64_t uptime_ms = esp_timer_get_time() / 1000ULL;
 
+  uint64_t uptime_ms = esp_timer_get_time() / 1000ULL;
   doc["uptime_ms"] = uptime_ms;
   doc["heap_free"] = ESP.getFreeHeap();
   doc["connected"] = (WiFi.status() == WL_CONNECTED);
-
-  float t = getInternalTemperatureC();
-  if (!isnan(t)) doc["temp_c"] = t;
-  else doc["temp_c"] = nullptr;
+  doc["temp_c"] = getInternalTemperatureC();
 
   doc["num_tasks"] = taskCount;
 
-  // Simplified - no redundant timing analysis needed
   JsonObject cpu = doc.createNestedObject("cpu_load");
   cpu["core0_percent"] = coreLoadPct[0];
   cpu["core1_percent"] = coreLoadPct[1];
@@ -1116,6 +1082,8 @@ void sendDebugInfo() {
 
   JsonArray tasks = doc.createNestedArray("top_tasks");
   for (uint8_t i = 0; i < taskCount; i++) {
+    if (taskData[i].state == eDeleted) continue;
+
     JsonObject tt = tasks.createNestedObject();
     tt["name"] = taskData[i].name;
     tt["runtime_us"] = (uint64_t)taskData[i].runtimeAccumUs;
@@ -1132,22 +1100,31 @@ void sendDebugInfo() {
   serializeJson(doc, output);
   server.send(200, "application/json", output);
 }
+
 void sendTaskMonitoring() {
   DynamicJsonDocument doc(5120);
   JsonArray arr = doc.createNestedArray("tasks");
+
+  uint8_t activeTaskCount = 0;
   for (uint8_t i = 0; i < taskCount; i++) {
+    // Skip deleted tasks
+    if (taskData[i].state == eDeleted) continue;
+    activeTaskCount++;
+
     JsonObject t = arr.createNestedObject();
     t["name"] = taskData[i].name;
     t["priority"] = taskData[i].priority;
     t["state"] = getTaskStateName(taskData[i].state);
-    t["runtime"] = (uint64_t)taskData[i].runtimeAccumUs / 1000000ULL;  // seconds (wrap-free)
+    t["runtime"] = (uint64_t)taskData[i].runtimeAccumUs / 1000000ULL;
     t["stack_hwm"] = taskData[i].stackHighWater;
     t["stack_health"] = taskData[i].stackHealth;
     t["cpu_percent"] = taskData[i].cpuPercent;
     t["core"] = getAffinityString(taskData[i].coreAffinity);
   }
-  doc["task_count"] = taskCount;
+
+  doc["task_count"] = activeTaskCount;
   doc["uptime_ms"] = millis();
+
   JsonObject coreSummary = doc.createNestedObject("core_summary");
   for (int c = 0; c < NUM_CORES; c++) {
     JsonObject core = coreSummary.createNestedObject(String(c));
@@ -1155,38 +1132,46 @@ void sendTaskMonitoring() {
     core["cpu_total"] = coreRuntime[c].cpuPercentTotal;
     core["load"] = coreLoadPct[c];
   }
+
   String out;
   out.reserve(5120);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
+
 // ============================================================================
-// REST handlers
+// REST Handlers
 // ============================================================================
+
 void hNetworkConfig() {
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"err\":\"no body\"}");
     return;
   }
+
   DynamicJsonDocument doc(512);
   DeserializationError error = deserializeJson(doc, server.arg("plain"));
   if (error) {
     server.send(400, "application/json", "{\"err\":\"bad json\"}");
     return;
   }
+
   const char* ssid = doc["ssid"] | "";
   const char* pass = doc["pass"] | "";
   bool dhcp = doc["dhcp"] | true;
+
   if (strlen(ssid) == 0) {
     server.send(400, "application/json", "{\"err\":\"ssid required\"}");
     return;
   }
+
   if (strlen(ssid) > 0) {
     prefs.putString("wifi_ssid", ssid);
     if (strlen(pass) > 0) {
       prefs.putString("wifi_pass", pass);
     }
   }
+
   netConfig.useDHCP = dhcp;
   if (!dhcp) {
     if (doc.containsKey("static_ip")) netConfig.staticIP = parseIP(String(doc["static_ip"].as<const char*>()));
@@ -1195,40 +1180,48 @@ void hNetworkConfig() {
     if (doc.containsKey("dns")) netConfig.dns = parseIP(String(doc["dns"].as<const char*>()));
     saveNetworkConfig();
   }
+
   wifiManualDisconnect = false;
   wifiReconnectAttempts = 0;
   wifiState = WIFI_STATE_IDLE;
+
   StaticJsonDocument<128> resp;
   resp["msg"] = "Saved, reconnecting...";
   String out;
   serializeJson(resp, out);
   server.send(200, "application/json", out);
 }
+
 void hExec() {
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"err\":\"no body\"}");
     return;
   }
+
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, server.arg("plain"));
   if (error) {
     server.send(400, "application/json", "{\"err\":\"parse error\"}");
     return;
   }
+
   const char* cmd = doc["cmd"] | "";
   size_t cmdLen = strlen(cmd);
   if (cmdLen == 0 || cmdLen >= MAX_MSG_SIZE) {
     server.send(400, "application/json", "{\"err\":\"invalid cmd\"}");
     return;
   }
+
   ExecMessage* msg = allocMessage();
   if (!msg) {
     server.send(503, "application/json", "{\"err\":\"pool full\"}");
     return;
   }
+
   memcpy(msg->payload, cmd, cmdLen);
   msg->payload[cmdLen] = '\0';
   msg->length = cmdLen;
+
   if (execQ && xQueueSend(execQ, &msg, 0) == pdTRUE) {
     server.send(200, "application/json", "{\"msg\":\"queued\"}");
   } else {
@@ -1236,18 +1229,21 @@ void hExec() {
     server.send(503, "application/json", "{\"err\":\"queue send failed\"}");
   }
 }
+
 void hBizStart() {
   gBizState = BIZ_RUNNING;
   server.send(200, "application/json", "{\"msg\":\"started\"}");
 }
+
 void hBizStop() {
   gBizState = BIZ_STOPPED;
   server.send(200, "application/json", "{\"msg\":\"stopped\"}");
 }
+
 // ============================================================================
-// HTML Dashboard - Simplified (No Timing Drift)
+// HTML Dashboard
 // ============================================================================
-// Main HTML - Always included
+
 static const char INDEX_HTML_PART1[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -1320,13 +1316,13 @@ pre {background:#0d1117;color:#c9d1d9;padding:10px;border-radius:4px;overflow-x:
   <div class="pill" id="ipInfo">IP: -</div>
   <div class="pill" id="rssiInfo">RSSI: --</div>
   <div class="pill">Up: <span id="upt">--:--:--</span></div>
-  <div class="pill">Heap: <span id="heap">--</span></div>
+  <div class="pill">Free Heap: <span id="heap">--</span>/<span id="heapTot">--</span></div>  
   <div class="pill">Temp: <span id="tempC">--</span></div>
  </div>
  <div class="row">
   <div class="pill"><span class="core-badge core-0">C0</span> <span id="c0">-</span>% (<span id="c0Tasks">-</span> tasks)</div>
   <div class="pill" id="c1pill"><span class="core-badge core-1">C1</span> <span id="c1">-</span>% (<span id="c1Tasks">-</span> tasks)</div>
-  <div class="pill">Total: <span id="taskCount">-</span></div>
+  <div class="pill">Active: <span id="taskCount">-</span></div>
   <div class="pill"><span id="chip">-</span> @ <span id="cpuFreq">-</span>MHz</div>
  </div>
 </div>
@@ -1385,7 +1381,6 @@ pre {background:#0d1117;color:#c9d1d9;padding:10px;border-radius:4px;overflow-x:
 </div>
 )rawliteral";
 
-// Debug Panel - Only included if DEBUG_MODE is enabled
 #if DEBUG_MODE
 static const char INDEX_HTML_DEBUG[] PROGMEM = R"rawliteral(
 <div class="card">
@@ -1395,7 +1390,6 @@ static const char INDEX_HTML_DEBUG[] PROGMEM = R"rawliteral(
 )rawliteral";
 #endif
 
-// JavaScript - Always included
 static const char INDEX_HTML_PART2[] PROGMEM = R"rawliteral(
 </div>
 <script>
@@ -1453,7 +1447,7 @@ async function refreshTasks(){
    <td>${t.priority}</td>
    <td><span class="${healthCls(t.stack_health)}">${t.stack_hwm}</span></td>
    <td><span class="task-state ${stCls(t.state)}">${t.state}</span></td>
-   <td><span class="cpu-badge ${cpuCls(cpuPct)}">${cpuPct.toFixed(1)}%</span>
+   <td><span class="cpu-badge ${cpuCls(cpuPct)}">${cpuPct}%</span>
      <div class="progress-bar"><div class="progress-fill" style="width:${cpuPct}%"></div></div></td>
    <td>${fmU((t.runtime||0)*1000)}</td>
   </tr>`;
@@ -1479,6 +1473,7 @@ async function refresh(){
  I('rssiInfo').textContent=`RSSI: ${j.rssi||'--'}`;
  I('upt').textContent=fmU(j.uptime_ms||0);
  I('heap').textContent=fmB(j.heap_free||0);
+ I('heapTot').textContent=fmB(j.heap_total||0);
  I('c0').textContent=j.core0_load??'-';
  I('c1').textContent=j.core1_load??'-';
  I('chip').textContent=j.chip_model||'-';
@@ -1494,7 +1489,6 @@ async function refresh(){
 }
 )rawliteral";
 
-// Debug JavaScript - Only included if DEBUG_MODE is enabled
 #if DEBUG_MODE
 static const char INDEX_HTML_DEBUG_JS[] PROGMEM = R"rawliteral(
 async function refreshDebug(){
@@ -1527,7 +1521,7 @@ async function refreshDebug(){
   top_10.forEach(t=>{
    const name=t.name.padEnd(14,' ');
    const core=String(t.core_affinity).padStart(3,' ');
-   const pct=String(t.percent_of_core.toFixed(1)+'%').padStart(6,' ');
+   const pct=String(t.percent_of_core+'%').padStart(5,' ');
    const runtime=String((t.runtime_ms/1000).toFixed(1)+'s').padStart(8,' ');
    const state=String(t.state).padEnd(8,' ');
    out+=` ${name} C${core} ${pct} ${runtime} ${state}\n`;
@@ -1540,7 +1534,6 @@ refreshDebug();
 )rawliteral";
 #endif
 
-// Closing JavaScript and HTML - Always included
 static const char INDEX_HTML_END[] PROGMEM = R"rawliteral(
 setInterval(refresh,2000);
 setInterval(refreshTasks,3000);
@@ -1550,39 +1543,32 @@ refreshTasks();
 </body>
 </html>
 )rawliteral";
-// ============================================================================
-// UPDATED sendIndex() function - Use this in your routes() function
-// ============================================================================
+
 static void sendIndex() {
-  const uint64_t tStart = micros64();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
-  // Send main HTML
   server.sendContent_P(INDEX_HTML_PART1);
   delay(1);
 #if DEBUG_MODE
-  // Send debug panel if enabled
   server.sendContent_P(INDEX_HTML_DEBUG);
   delay(1);
 #endif
-  // Send JavaScript
   server.sendContent_P(INDEX_HTML_PART2);
   delay(1);
 #if DEBUG_MODE
-  // Send debug JavaScript if enabled
   server.sendContent_P(INDEX_HTML_DEBUG_JS);
   delay(1);
 #endif
-  // Send closing tags
   server.sendContent_P(INDEX_HTML_END);
   server.client().flush();
   delay(2);
   server.client().stop();
-  const uint64_t tEnd = micros64();
 }
+
 // ============================================================================
-// routes
+// Routes
 // ============================================================================
+
 void routes() {
   server.on("/", HTTP_GET, sendIndex);
   server.on("/api/status", HTTP_GET, handleApiStatus);
@@ -1597,27 +1583,30 @@ void routes() {
   server.onNotFound([]() {
     server.send(404, "application/json", "{\"err\":\"not found\"}");
   });
+
   if (WiFi.getMode() == WIFI_OFF) {
     WiFi.mode(WIFI_STA);
     delay(100);
   }
   server.begin();
 }
+
 // ============================================================================
-// RTOS tasks
+// RTOS Tasks
 // ============================================================================
+
 void systemTask(void* param) {
   esp_task_wdt_add(NULL);
   bool ledState = false;
   uint32_t ledTs = 0;
   pinMode(BLE_LED_PIN, OUTPUT);
   digitalWrite(BLE_LED_PIN, LOW);
+
   for (;;) {
     esp_task_wdt_reset();
     checkWiFiConnection();
     handleBLEReconnect();
     updateCpuLoad();
-    monitorHeapHealth();
     checkTaskStacks();
 
     if (bleDeviceConnected) {
@@ -1635,6 +1624,7 @@ void systemTask(void* param) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
+
 void webTask(void* param) {
   esp_task_wdt_add(NULL);
   for (;;) {
@@ -1644,9 +1634,11 @@ void webTask(void* param) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+
 void bizTask(void* param) {
   esp_task_wdt_add(NULL);
   ExecMessage* msg = nullptr;
+
   for (;;) {
     esp_task_wdt_reset();
     if (gBizState == BIZ_RUNNING) {
@@ -1663,16 +1655,20 @@ void bizTask(void* param) {
     }
   }
 }
-// ============================================================================
-// setup + loop
-// ============================================================================
-void setup() {
 
+// ============================================================================
+// Setup & Loop
+// ============================================================================
+
+void setup() {
   delay(300);
+
+  // Suppress verbose ESP logs
   esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_log_level_set("dhcpc", ESP_LOG_WARN);
   esp_log_level_set("phy_init", ESP_LOG_WARN);
 
+  // Configure watchdog
   esp_task_wdt_deinit();
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = WDT_TIMEOUT * 1000,
@@ -1680,22 +1676,26 @@ void setup() {
     .trigger_panic = true
   };
   esp_task_wdt_init(&wdt_config);
-  prefs.begin("rngds_base", false);
+
+  // Initialize NVS and load config
+  prefs.begin("esp32_base", false);
   loadNetworkConfig();
-#if RNGDS_HAS_TEMP
-  {
-    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
-    if (temperature_sensor_install(&cfg, &s_temp_sensor) == ESP_OK) {
-      if (temperature_sensor_enable(s_temp_sensor) == ESP_OK) {
-      }
-    }
+
+  // Initialize temperature sensor if available
+#if ESP32_HAS_TEMP
+  temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
+  if (temperature_sensor_install(&cfg, &s_temp_sensor) == ESP_OK) {
+    temperature_sensor_enable(s_temp_sensor);
   }
 #endif
+
   initMessagePool();
   initBLE();
   setupWiFi();
   routes();
+
   execQ = xQueueCreate(MSG_POOL_SIZE, sizeof(ExecMessage*));
+
   // Initialize per-core runtime structures
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].totalRuntime100ms = 0;
@@ -1703,22 +1703,22 @@ void setup() {
     coreRuntime[c].taskCount = 0;
     coreRuntime[c].cpuPercentTotal = 0;
   }
-  // Calibrate CPU load BEFORE creating tasks
+
+  // Calibrate CPU load monitor (3 second delay)
   startCpuLoadMonitor();
 
+  // Create RTOS tasks
 #if NUM_CORES > 1
   xTaskCreatePinnedToCore(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle, 1);
   xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, &webTaskHandle, 0);
   xTaskCreatePinnedToCore(systemTask, "sys", 3072, nullptr, 2, &sysTaskHandle, 0);
-
 #else
   xTaskCreate(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle);
   xTaskCreate(webTask, "web", 8192, nullptr, 1, &webTaskHandle);
   xTaskCreate(systemTask, "sys", 3072, nullptr, 2, &sysTaskHandle);
-
 #endif
-  minHeapEver = ESP.getFreeHeap();
 }
+
 void loop() {
   vTaskDelete(NULL);
 }
