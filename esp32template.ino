@@ -95,6 +95,13 @@ struct ExecMessage {
 // 64-bit version: true microsecond precision, ~584 000 years before wrap
 // Replace below if you want ultra-long drift-free tracking
 
+// ===== CPU load metering (declare before functions that use them) =====
+volatile uint32_t idleCnt[2] = { 0, 0 };
+volatile uint32_t idleCal[2] = { 1, 1 };
+volatile uint32_t lastIdle[2] = { 0, 0 };
+volatile uint8_t coreLoadPct[2] = { 0, 0 };
+uint32_t lastLoadTs = 0;
+
 static uint64_t runtimeOffsetUs = 0;
 
 extern "C" void configureTimerForRunTimeStats(void) {
@@ -159,13 +166,14 @@ struct {
 WebServer server(80);
 Preferences prefs;
 // ===== task monitoring WITH PER-CORE AWARENESS =====
-#define MAX_TASKS_MONITORED 24
+#define MAX_TASKS_MONITORED 64
 struct TaskMonitorData {
   String name;
   UBaseType_t priority;
   eTaskState state;
   uint32_t runtime;
   uint32_t prevRuntime;
+  uint64_t runtimeAccumUs; // 64-bit wrap-free accumulator of task runtime in microseconds
   uint32_t stackHighWater;
   uint8_t cpuPercent; // Per-core aware instantaneous CPU%
   String stackHealth;
@@ -187,12 +195,39 @@ struct CoreRuntimeData {
 CoreRuntimeData coreRuntime[2]; // Index 0 = Core 0, Index 1 = Core 1
 uint64_t noAffinityRuntime100ms = 0; // Tasks with no affinity
 uint64_t prevNoAffinityRuntime100ms = 0;
-// ===== CPU load metering =====
-volatile uint32_t idleCnt[2] = { 0, 0 };
-volatile uint32_t idleCal[2] = { 1, 1 };
-volatile uint32_t lastIdle[2] = { 0, 0 };
-volatile uint8_t coreLoadPct[2] = { 0, 0 };
-uint32_t lastLoadTs = 0;
+// Long-term wrap-free accumulators (microseconds)
+uint64_t coreAccumUs[2] = { 0, 0 };
+uint64_t noAffinityAccumUs = 0;
+// ISR/Overhead accounting
+uint64_t isrOverheadAccumUs = 0; // accumulated time not accounted to any task
+uint64_t lastSampleWallUs = 0;   // last sample timestamp (esp_timer_get_time)
+// Idle-based effective runtime accumulator (milliseconds across all cores)
+uint64_t idleEffectiveMsAccum = 0;
+uint64_t idleEffLastSampleUs = 0;
+uint64_t lastTotalRuntimeUs = 0; // fallback source when load is unavailable
+static esp_timer_handle_t s_idleEffTimer = NULL;
+
+static void idleEffTimerCb(void* arg) {
+  (void)arg;
+  uint64_t nowUs = esp_timer_get_time();
+  
+  // First call: seed accumulator to current uptime
+  if (idleEffLastSampleUs == 0) {
+    idleEffectiveMsAccum = nowUs / 1000ULL;  // Seed to current uptime
+    idleEffLastSampleUs = nowUs;
+    return;  // Exit, start accumulating from next callback
+  }
+  
+  uint64_t elapsedUs = nowUs - idleEffLastSampleUs;
+  idleEffLastSampleUs = nowUs;
+  
+  if (elapsedUs == 0) return;
+  if (elapsedUs > 500000ULL) elapsedUs = 500000ULL; // clamp to 500ms window
+  
+  // Accumulate wall-clock time
+  idleEffectiveMsAccum += elapsedUs / 1000ULL;
+}
+
 uint32_t lastStackCheck = 0;
 // ===== heap tracking =====
 uint32_t lastHeapCheck = 0;
@@ -300,7 +335,6 @@ void startCpuLoadMonitor() {
 #if NUM_CORES > 1
   esp_register_freertos_idle_hook_for_cpu(idleHook1, 1);
 #endif
-  HWSerial.println("Calibrating idle loops...");
   uint32_t s0[2] = { idleCnt[0], idleCnt[1] };
   uint64_t t0 = esp_timer_get_time();
   delay(3000);
@@ -313,7 +347,10 @@ void startCpuLoadMonitor() {
   lastIdle[0] = idleCnt[0];
   lastIdle[1] = idleCnt[1];
   lastLoadTs = millis();
-  HWSerial.printf("Idle calib: C0=%u C1=%u counts/s\n", idleCal[0], idleCal[1]);
+  
+  // FIX: Seed integrator to current uptime to avoid startup drift
+  uint64_t currentUptimeUs = esp_timer_get_time();
+ 
 }
 void updateCpuLoad() {
   uint32_t now = millis();
@@ -327,7 +364,7 @@ void updateCpuLoad() {
     if (ratio > 1.0f) ratio = 1.0f;
     if (ratio < 0.0f) ratio = 0.0f;
     uint8_t newLoad = (uint8_t)(100.0f * (1.0f - ratio) + 0.5f);
-    coreLoadPct[c] = (coreLoadPct[c] * 3 + newLoad) / 4;
+    coreLoadPct[c] = (coreLoadPct[c] + newLoad) / 2; // less smoothing (EMA 1/2)
   }
 }
 // ============================================================================
@@ -344,11 +381,9 @@ void monitorHeapHealth() {
   }
 #if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C6) || defined(CONFIG_IDF_TARGET_ESP32S2)
   if (currentFree < 10000) {
-    HWSerial.printf("LOW HEAP (small chip): Free=%d, Min=%d\n", currentFree, minFree);
   }
 #else
   if (currentFree < 20000) {
-    HWSerial.printf("LOW HEAP: Free=%d, Min=%d\n", currentFree, minFree);
   }
 #endif
 }
@@ -359,19 +394,16 @@ void checkTaskStacks() {
   if (webTaskHandle) {
     UBaseType_t w = uxTaskGetStackHighWaterMark(webTaskHandle);
     if (w < 512) {
-      HWSerial.printf("Web task stack low: %u\n", w);
     }
   }
   if (bizTaskHandle) {
     UBaseType_t w = uxTaskGetStackHighWaterMark(bizTaskHandle);
     if (w < 512) {
-      HWSerial.printf("Biz task stack low: %u\n", w);
     }
   }
   if (sysTaskHandle) {
     UBaseType_t w = uxTaskGetStackHighWaterMark(sysTaskHandle);
     if (w < 512) {
-      HWSerial.printf("Sys task stack low: %u\n", w);
     }
   }
 }
@@ -539,7 +571,6 @@ class MyCharCallbacks : public NimBLECharacteristicCallbacks {
 };
 void initBLE() {
   NimBLEDevice::init("RNGDS_ESP32x");
-  HWSerial.println("BLE ready: RNGDS_ESP32x");
   NimBLEDevice::setMTU(256);
   pBLEServer = NimBLEDevice::createServer();
   pBLEServer->setCallbacks(new MyServerCallbacks());
@@ -563,7 +594,6 @@ void initBLE() {
   pAdvertising->setScanResponseData(scanData);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   pAdvertising->start();
-  HWSerial.println("BLE advertising started");
 }
 void handleBLEReconnect() {
   if (!bleDeviceConnected && bleOldDeviceConnected) {
@@ -577,7 +607,6 @@ void handleBLEReconnect() {
 }
 #else
 void initBLE() {
-  HWSerial.println("BLE not available on this target");
 }
 void handleBLEReconnect() {}
 #endif
@@ -619,7 +648,6 @@ void handleBLECommand(String cmd) {
     wifiReconnectAttempts = 0;
     wifiState = WIFI_STATE_IDLE;
     sendBLE("OK:WIFI_SAVED\n");
-    HWSerial.println("WiFi: Restarting with new credentials");
     WiFi.disconnect(true, true);
     delay(500);
     WiFi.mode(WIFI_OFF);
@@ -633,7 +661,6 @@ void handleBLECommand(String cmd) {
     WiFi.begin(ssid.c_str(), pass.c_str());
     wifiState = WIFI_STATE_CONNECTING;
     wifiLastConnectAttempt = millis();
-    HWSerial.printf("WiFi: Connecting to '%s'\n", ssid.c_str());
   } else if (upper.startsWith("SET_IP|")) {
     String rest = cmd.substring(7);
     if (rest.equalsIgnoreCase("DHCP")) {
@@ -734,10 +761,8 @@ void setupWiFi() {
   String ssid = prefs.getString("wifi_ssid", "");
   String pass = prefs.getString("wifi_pass", "");
   if (ssid.length() == 0) {
-    HWSerial.println("WiFi: no saved credentials");
     return;
   }
-  HWSerial.printf("WiFi: using saved SSID '%s'\n", ssid.c_str());
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
       case ARDUINO_EVENT_WIFI_STA_CONNECTED:
@@ -756,10 +781,8 @@ void setupWiFi() {
     }
   });
   if (!netConfig.useDHCP) {
-    HWSerial.println("WiFi: static IP selected");
     WiFi.config(netConfig.staticIP, netConfig.gateway, netConfig.subnet, netConfig.dns);
   } else {
-    HWSerial.println("WiFi: DHCP selected");
   }
   WiFi.begin(ssid.c_str(), pass.c_str());
   wifiState = WIFI_STATE_CONNECTING;
@@ -775,7 +798,6 @@ void checkWiFiConnection() {
       {
         if (prefs.getString("wifi_ssid", "").length() > 0) {
           if (wifiReconnectAttempts >= MAX_WIFI_RECONNECT_ATTEMPTS) {
-            HWSerial.println("WiFi: reached max retries, stopping");
             wifiManualDisconnect = true;
             return;
           }
@@ -783,8 +805,6 @@ void checkWiFiConnection() {
           wifiLastConnectAttempt = now;
           String ssid = prefs.getString("wifi_ssid", "");
           String pass = prefs.getString("wifi_pass", "");
-          HWSerial.printf("WiFi: connecting to '%s' (%d/%d)\n",
-                          ssid.c_str(), wifiReconnectAttempts + 1, MAX_WIFI_RECONNECT_ATTEMPTS);
           WiFi.begin(ssid.c_str(), pass.c_str());
           wifiReconnectAttempts++;
         }
@@ -795,10 +815,8 @@ void checkWiFiConnection() {
         if (status == WL_CONNECTED) {
           wifiState = WIFI_STATE_CONNECTED;
           wifiReconnectAttempts = 0;
-          HWSerial.println("WiFi: connected");
-          HWSerial.printf("WiFi: IP: %s\n", WiFi.localIP().toString().c_str());
+          
         } else if (now - wifiLastConnectAttempt > WIFI_CONNECT_TIMEOUT) {
-          HWSerial.println("WiFi: connect timeout");
           wifiState = WIFI_STATE_DISCONNECTED;
         }
       }
@@ -806,7 +824,6 @@ void checkWiFiConnection() {
     case WIFI_STATE_CONNECTED:
       {
         if (status != WL_CONNECTED) {
-          HWSerial.println("WiFi: lost connection");
           wifiState = WIFI_STATE_DISCONNECTED;
         }
       }
@@ -847,14 +864,27 @@ String getAffinityString(BaseType_t affinity) {
   }
   return String(affinity);
 }
+// Safe affinity getter across single/dual core targets
+static inline BaseType_t getSafeAffinity(TaskHandle_t handle) {
+#if CONFIG_FREERTOS_UNICORE
+  (void)handle;
+  return 0; // single-core: treat as core 0
+#else
+  if (handle == nullptr) return tskNO_AFFINITY;
+  return xTaskGetAffinity(handle);
+#endif
+}
 // ============================================================================
 // PER-CORE Task Monitoring - The Core Algorithm
 // ============================================================================
 void updateTaskMonitoring() {
-  if (millis() - lastTaskSample < 3000) return;
+  if (millis() - lastTaskSample < 500) return;
   lastTaskSample = millis();
+  
+  uint64_t sampleStartUs = esp_timer_get_time();
   TaskStatus_t statusArray[MAX_TASKS_MONITORED];
   UBaseType_t numTasks = uxTaskGetSystemState(statusArray, MAX_TASKS_MONITORED, NULL);
+  
   if (numTasks == 0) return;
   // Reset per-core counters
   for (int c = 0; c < NUM_CORES; c++) {
@@ -865,8 +895,9 @@ void updateTaskMonitoring() {
   noAffinityRuntime100ms = 0;
   // First pass: Calculate per-core totals using xTaskGetAffinity()
   for (uint8_t j = 0; j < numTasks; j++) {
-    BaseType_t affinity = xTaskGetAffinity(statusArray[j].xHandle);
+    BaseType_t affinity = getSafeAffinity(statusArray[j].xHandle);
     uint32_t runtime = statusArray[j].ulRunTimeCounter;
+    
     if (affinity == tskNO_AFFINITY) {
       // Task can migrate between cores
       noAffinityRuntime100ms += (uint64_t)runtime;
@@ -881,8 +912,11 @@ void updateTaskMonitoring() {
   for (int c = 0; c < NUM_CORES; c++) {
     coreDelta[c] = coreRuntime[c].totalRuntime100ms - coreRuntime[c].prevTotalRuntime100ms;
     if (coreDelta[c] == 0) coreDelta[c] = 1; // Avoid division by zero
+    
+                    
   }
   uint64_t noAffinityDelta = noAffinityRuntime100ms - prevNoAffinityRuntime100ms;
+  
   // First time init
   if (!statsInitialized) {
     taskCount = (numTasks > MAX_TASKS_MONITORED) ? MAX_TASKS_MONITORED : numTasks;
@@ -892,21 +926,24 @@ void updateTaskMonitoring() {
       taskData[i].state = statusArray[i].eCurrentState;
       taskData[i].runtime = statusArray[i].ulRunTimeCounter;
       taskData[i].prevRuntime = statusArray[i].ulRunTimeCounter;
-      taskData[i].stackHighWater = uxTaskGetStackHighWaterMark(statusArray[i].xHandle);
+      taskData[i].runtimeAccumUs = (uint64_t)statusArray[i].ulRunTimeCounter;
+      taskData[i].stackHighWater = statusArray[i].xHandle ? uxTaskGetStackHighWaterMark(statusArray[i].xHandle) : 0;
       taskData[i].stackHealth = getStackHealth(taskData[i].stackHighWater);
       taskData[i].cpuPercent = 0;
       taskData[i].handle = statusArray[i].xHandle;
-      taskData[i].coreAffinity = xTaskGetAffinity(statusArray[i].xHandle);
+      taskData[i].coreAffinity = getSafeAffinity(statusArray[i].xHandle);
+      
+      // No seeding of core accumulators at init; accumulate only deltas to avoid double counting
     }
     for (int c = 0; c < NUM_CORES; c++) {
       coreRuntime[c].prevTotalRuntime100ms = coreRuntime[c].totalRuntime100ms;
     }
     prevNoAffinityRuntime100ms = noAffinityRuntime100ms;
     statsInitialized = true;
-    HWSerial.println("Task monitoring initialized with per-core isolation");
     return;
   }
   // Update existing tasks with PER-CORE CPU calculation
+  uint64_t sumTaskDeltaUs = 0; // sum of all task deltas in this window
   for (uint8_t i = 0; i < taskCount; i++) {
     bool found = false;
     for (uint8_t j = 0; j < numTasks; j++) {
@@ -916,9 +953,18 @@ void updateTaskMonitoring() {
         if (currentRuntime100ms < taskData[i].prevRuntime) {
           taskDelta100ms += (1ULL << 32); // Handle single wrap
         }
+        sumTaskDeltaUs += taskDelta100ms;
+        // accumulate wrap-free per-task runtime in microseconds
+        taskData[i].runtimeAccumUs += taskDelta100ms;
         // Get task affinity
-        BaseType_t affinity = xTaskGetAffinity(statusArray[j].xHandle);
+        BaseType_t affinity = getSafeAffinity(statusArray[j].xHandle);
         taskData[i].coreAffinity = affinity;
+        // accumulate per-core totals (wrap-free)
+        if (affinity == tskNO_AFFINITY) {
+          noAffinityAccumUs += taskDelta100ms;
+        } else if (affinity >= 0 && affinity < NUM_CORES) {
+          coreAccumUs[affinity] += taskDelta100ms;
+        }
         // Calculate CPU% based on core affinity
         if (affinity == tskNO_AFFINITY) {
           // Task can run on any core - calculate against total of all cores
@@ -929,26 +975,32 @@ void updateTaskMonitoring() {
           if (totalCoreDelta > 0) {
             uint64_t percentage = (taskDelta100ms * 100ULL) / totalCoreDelta;
             taskData[i].cpuPercent = (percentage > 100) ? 100 : (uint8_t)percentage;
+            
           } else {
             taskData[i].cpuPercent = 0;
+            
           }
         } else if (affinity >= 0 && affinity < NUM_CORES) {
           // Task pinned to specific core - calculate against that core only
           if (coreDelta[affinity] > 0) {
             uint64_t percentage = (taskDelta100ms * 100ULL) / coreDelta[affinity];
             taskData[i].cpuPercent = (percentage > 100) ? 100 : (uint8_t)percentage;
+            
           } else {
             taskData[i].cpuPercent = 0;
+            
           }
           coreRuntime[affinity].cpuPercentTotal += taskData[i].cpuPercent;
+          
         } else {
           taskData[i].cpuPercent = 0;
+          
         }
         taskData[i].priority = statusArray[j].uxCurrentPriority;
         taskData[i].state = statusArray[j].eCurrentState;
         taskData[i].runtime = currentRuntime100ms;
         taskData[i].prevRuntime = currentRuntime100ms;
-        taskData[i].stackHighWater = uxTaskGetStackHighWaterMark(statusArray[j].xHandle);
+        taskData[i].stackHighWater = statusArray[j].xHandle ? uxTaskGetStackHighWaterMark(statusArray[j].xHandle) : 0;
         taskData[i].stackHealth = getStackHealth(taskData[i].stackHighWater);
         taskData[i].handle = statusArray[j].xHandle;
         found = true;
@@ -975,27 +1027,33 @@ void updateTaskMonitoring() {
       taskData[taskCount].state = statusArray[j].eCurrentState;
       taskData[taskCount].runtime = statusArray[j].ulRunTimeCounter;
       taskData[taskCount].prevRuntime = statusArray[j].ulRunTimeCounter;
-      taskData[taskCount].stackHighWater = uxTaskGetStackHighWaterMark(statusArray[j].xHandle);
+      taskData[taskCount].runtimeAccumUs = (uint64_t)statusArray[j].ulRunTimeCounter;
+      taskData[taskCount].stackHighWater = statusArray[j].xHandle ? uxTaskGetStackHighWaterMark(statusArray[j].xHandle) : 0;
       taskData[taskCount].stackHealth = getStackHealth(taskData[taskCount].stackHighWater);
       taskData[taskCount].cpuPercent = 0;
       taskData[taskCount].handle = statusArray[j].xHandle;
-      taskData[taskCount].coreAffinity = xTaskGetAffinity(statusArray[j].xHandle);
+      taskData[taskCount].coreAffinity = getSafeAffinity(statusArray[j].xHandle);
       taskCount++;
+      
+      // No seeding at add; we accumulate only per-sample deltas
     }
   }
   // Store totals for next sample
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].prevTotalRuntime100ms = coreRuntime[c].totalRuntime100ms;
+    
   }
   prevNoAffinityRuntime100ms = noAffinityRuntime100ms;
-#if DEBUG_MODE
-  HWSerial.println("=== Per-Core Task Distribution ===");
-  for (int c = 0; c < NUM_CORES; c++) {
-    HWSerial.printf("Core %d: %u tasks, CPU total: %u%%, Delta: %llu ticks\n",
-                    c, coreRuntime[c].taskCount, coreRuntime[c].cpuPercentTotal, (unsigned long long)coreDelta[c]);
+  
+
+  // ISR/overhead: anything not accounted to tasks in this window
+  if (lastSampleWallUs != 0) {
+    uint64_t wallDeltaUsAllCores = (sampleStartUs - lastSampleWallUs) * (uint64_t)NUM_CORES;
+    uint64_t overheadDeltaUs = (wallDeltaUsAllCores > sumTaskDeltaUs) ? (wallDeltaUsAllCores - sumTaskDeltaUs) : 0;
+    isrOverheadAccumUs += overheadDeltaUs;
+    
   }
-  HWSerial.printf("No affinity: %llu ticks, Delta: %llu\n", (unsigned long long)noAffinityRuntime100ms, (unsigned long long)noAffinityDelta);
-#endif
+  lastSampleWallUs = sampleStartUs;
 }
 // ============================================================================
 // Runtime Drift Diagnostics
@@ -1004,20 +1062,38 @@ static uint64_t lastDriftCheckUs = 0;
 static uint64_t driftAccumUs = 0;
 void diagRuntimeDrift() {
   const uint64_t tNow = micros64();
-  if (lastDriftCheckUs = 0) {
+  if (lastDriftCheckUs == 0) {
     lastDriftCheckUs = tNow;
     return;
   }
   const uint64_t deltaUs = tNow - lastDriftCheckUs;
   lastDriftCheckUs = tNow;
   driftAccumUs += deltaUs;
-#if DEBUG_MODE
-  static uint32_t driftCount = 0;
-  if (++driftCount % 10 == 0) {
-    HWSerial.printf("[DRIFT] avg drift per tick: %.3f ms\n",
-                    (driftAccumUs / (float)driftCount) / 1000.0f);
+  
+}
+
+// ============================================================================
+// Focused Runtime Metrics Serial Output
+// ============================================================================
+static uint32_t lastRuntimePrintMs = 0;
+void printRuntimeMetrics() {
+  uint32_t now = millis();
+  if (now - lastRuntimePrintMs < 5000) return; // print every 5s
+  lastRuntimePrintMs = now;
+
+  uint64_t uptime_ms = esp_timer_get_time() / 1000ULL;
+
+  // Use cumulative idle-based effective runtime derived in systemTask
+  uint64_t total_cpu_time_ms = idleEffectiveMsAccum;
+  uint64_t effective_runtime_ms = (NUM_CORES > 0) ? (idleEffectiveMsAccum / NUM_CORES) : 0;
+  int64_t diff_ms = (int64_t)uptime_ms - (int64_t)effective_runtime_ms;
+  float diff_pct = (uptime_ms > 0) ? ((float)diff_ms / (float)uptime_ms) * 100.0f : 0.0f;
+
+  
+
+  for (int c = 0; c < NUM_CORES; c++) {
+    
   }
-#endif
 }
 // ============================================================================
 // API endpoints
@@ -1074,6 +1150,7 @@ void sendDebugInfo() {
   DynamicJsonDocument doc(4096);
   uint64_t uptime_ms = esp_timer_get_time() / 1000ULL;
   uint64_t esp_timer_us = esp_timer_get_time();
+  
   doc["uptime_ms"] = uptime_ms;
   doc["esp_timer_us"] = esp_timer_us;
   doc["heap_free"] = ESP.getFreeHeap();
@@ -1081,31 +1158,17 @@ void sendDebugInfo() {
   float t = getInternalTemperatureC();
   if (!isnan(t)) doc["temp_c"] = t;
   else doc["temp_c"] = nullptr;
-  TaskStatus_t statusArray[MAX_TASKS_MONITORED];
-  // CRITICAL DEBUG: Initialize to a known value
-  uint32_t dummyTotal = 0xDEADBEEF;
-  HWSerial.printf("[DEBUG] Before uxTaskGetSystemState: dummyTotal = %u (0x%08X)\n",
-                  dummyTotal, dummyTotal);
-  UBaseType_t numTasks = uxTaskGetSystemState(statusArray, MAX_TASKS_MONITORED, NULL);
-  HWSerial.printf("[DEBUG] After uxTaskGetSystemState: dummyTotal = %u (0x%08X)\n",
-                  dummyTotal, dummyTotal);
-  HWSerial.printf("[DEBUG] numTasks = %u\n", numTasks);
-  HWSerial.printf("[DEBUG] Address of dummyTotal = %p\n", (void*)&dummyTotal);
-  // Let's also check what ulGetRunTimeCounterValue returns directly
-  uint32_t directCounter = ulGetRunTimeCounterValue();
-  HWSerial.printf("[DEBUG] Direct ulGetRunTimeCounterValue() = %u (0x%08X)\n",
-                  directCounter, directCounter);
-  // Manually sum total runtime as uint64_t
-  uint64_t totalRuntimeCounter = 0;
-  for (UBaseType_t j = 0; j < numTasks; j++) {
-    totalRuntimeCounter += (uint64_t)statusArray[j].ulRunTimeCounter;
-  }
-  doc["runtime_counter"] = totalRuntimeCounter;
-  doc["runtime_resolution"] = "100ms units";
-  uint64_t total_cpu_time_ms = totalRuntimeCounter * 100ULL;
+  // Simplified totals based on idle-derived load
+  // Use cumulative idle-based effective runtime derived in systemTask
+  uint64_t total_cpu_time_ms = idleEffectiveMsAccum;
+  uint64_t effective_runtime_ms = (NUM_CORES > 0) ? (idleEffectiveMsAccum / NUM_CORES) : 0;
+  doc["runtime_counter"] = nullptr;
+  doc["runtime_resolution"] = "derived_from_idle";
   doc["total_cpu_time_ms"] = total_cpu_time_ms;
-  uint64_t effective_runtime_ms = (NUM_CORES > 0) ? total_cpu_time_ms / NUM_CORES : 0;
   doc["effective_runtime_ms"] = effective_runtime_ms;
+  
+  doc["isr_overhead_us"] = nullptr; // deprecated in idle-based effective runtime
+  doc["isr_overhead_percent"] = nullptr;
   doc["num_tasks"] = taskCount;
   JsonObject timing = doc.createNestedObject("timing_analysis");
   int64_t diff_ms = (int64_t)uptime_ms - (int64_t)effective_runtime_ms;
@@ -1113,6 +1176,7 @@ void sendDebugInfo() {
   timing["uptime_vs_effective_diff_ms"] = diff_ms;
   timing["difference_percent"] = diff_pct;
   timing["status"] = (abs(diff_pct) < 5.0f) ? "GOOD" : "ISSUE";
+  
   JsonObject cpu = doc.createNestedObject("cpu_load");
   cpu["core0_percent"] = coreLoadPct[0];
   cpu["core1_percent"] = coreLoadPct[1];
@@ -1120,17 +1184,18 @@ void sendDebugInfo() {
   for (int c = 0; c < NUM_CORES; c++) {
     JsonObject core = coresDetail.createNestedObject(String(c));
     core["tasks"] = coreRuntime[c].taskCount;
-    core["runtime_ticks"] = coreRuntime[c].totalRuntime100ms;
-    core["runtime_ms"] = (double)(coreRuntime[c].totalRuntime100ms * 100ULL);
+    core["runtime_ticks"] = (uint64_t)coreAccumUs[c];
+    core["runtime_ms"] = (double)coreAccumUs[c] / 1000.0;
     core["cpu_total_pct"] = coreRuntime[c].cpuPercentTotal;
     core["idle_load"] = coreLoadPct[c];
   }
+  doc["no_affinity_runtime_us"] = (uint64_t)noAffinityAccumUs;
   JsonArray tasks = doc.createNestedArray("top_tasks");
   for (uint8_t i = 0; i < taskCount; i++) {
     JsonObject tt = tasks.createNestedObject();
     tt["name"] = taskData[i].name;
     tt["runtime_ticks"] = taskData[i].runtime;
-    double task_ms = (double)((uint64_t)taskData[i].runtime * 100ULL);
+    double task_ms = (double)taskData[i].runtime / 1000.0;
     tt["runtime_ms"] = task_ms;
     tt["runtime_seconds"] = task_ms / 1000.0;
     tt["percent_of_core"] = taskData[i].cpuPercent;
@@ -1152,7 +1217,7 @@ void sendTaskMonitoring() {
     t["name"] = taskData[i].name;
     t["priority"] = taskData[i].priority;
     t["state"] = getTaskStateName(taskData[i].state);
-    t["runtime"] = (uint64_t)taskData[i].runtime / 10ULL; // seconds
+    t["runtime"] = (uint64_t)taskData[i].runtimeAccumUs / 1000000ULL; // seconds (wrap-free)
     t["stack_hwm"] = taskData[i].stackHighWater;
     t["stack_health"] = taskData[i].stackHealth;
     t["cpu_percent"] = taskData[i].cpuPercent;
@@ -1490,7 +1555,7 @@ async function refreshTasks(){
    <td><span class="task-state ${stCls(t.state)}">${t.state}</span></td>
    <td><span class="cpu-badge ${cpuCls(cpuPct)}">${cpuPct.toFixed(1)}%</span>
      <div class="progress-bar"><div class="progress-fill" style="width:${cpuPct}%"></div></div></td>
-   <td>${t.runtime}</td>
+   <td>${fmU((t.runtime||0)*1000)}</td>
   </tr>`;
  });
  h+='</tbody></table>';
@@ -1693,9 +1758,6 @@ static void sendIndex() {
   delay(2);
   server.client().stop();
   const uint64_t tEnd = micros64();
-#if DEBUG_MODE
-  HWSerial.printf("[WEB] sendIndex() completed in %.3f ms\n", usToMs(tEnd - tStart));
-#endif
 }
 // ============================================================================
 // routes
@@ -1736,6 +1798,7 @@ void systemTask(void* param) {
     updateCpuLoad();
     monitorHeapHealth();
     checkTaskStacks();
+    
     if (bleDeviceConnected) {
       uint32_t now = millis();
       if (now - ledTs > BLE_LED_BLINK_MS) {
@@ -1748,6 +1811,7 @@ void systemTask(void* param) {
       ledState = false;
     }
     diagRuntimeDrift();
+    printRuntimeMetrics();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -1783,21 +1847,12 @@ void bizTask(void* param) {
 // setup + loop
 // ============================================================================
 void setup() {
-  HWSerial.begin(115200);
-  while (!HWSerial) {
-    vTaskDelay(pdMS_TO_TICKS(10)); // Wait for serial monitor to connect
-  }
+  
   delay(300);
   esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_log_level_set("dhcpc", ESP_LOG_WARN);
   esp_log_level_set("phy_init", ESP_LOG_WARN);
-  HWSerial.println();
-  HWSerial.println("=== ESP32(x) Per-Core Monitor (ESP-IDF 5.1) ===");
-#if DEBUG_MODE
-  HWSerial.println("DEBUG MODE: ENABLED");
-#endif
-  HWSerial.printf("Chip: %s | Cores: %d | Freq: %d MHz\n",
-                  ESP.getChipModel(), NUM_CORES, ESP.getCpuFreqMHz());
+  
   esp_task_wdt_deinit();
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = WDT_TIMEOUT * 1000,
@@ -1812,7 +1867,6 @@ void setup() {
     temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
     if (temperature_sensor_install(&cfg, &s_temp_sensor) == ESP_OK) {
       if (temperature_sensor_enable(s_temp_sensor) == ESP_OK) {
-        HWSerial.println("Temperature sensor enabled");
       }
     }
   }
@@ -1831,20 +1885,31 @@ void setup() {
   }
   // Calibrate CPU load BEFORE creating tasks
   startCpuLoadMonitor();
+  // Start idle-based effective runtime integrator (100 ms cadence)
+  if (s_idleEffTimer == NULL) {
+    const esp_timer_create_args_t args = {
+      .callback = idleEffTimerCb,
+      .arg = NULL,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "idle_eff"
+    };
+    if (esp_timer_create(&args, &s_idleEffTimer) == ESP_OK) {
+      esp_timer_start_periodic(s_idleEffTimer, 100000); // 100 ms
+    }
+  }
 #if NUM_CORES > 1
   xTaskCreatePinnedToCore(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle, 1);
   xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, &webTaskHandle, 0);
   xTaskCreatePinnedToCore(systemTask, "sys", 3072, nullptr, 2, &sysTaskHandle, 0);
-  HWSerial.println("Tasks pinned: biz→C1, web→C0, sys→C0");
+  
 #else
   xTaskCreate(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle);
   xTaskCreate(webTask, "web", 8192, nullptr, 1, &webTaskHandle);
   xTaskCreate(systemTask, "sys", 3072, nullptr, 2, &sysTaskHandle);
-  HWSerial.println("Single-core mode: all tasks on C0");
+  
 #endif
   minHeapEver = ESP.getFreeHeap();
-  HWSerial.println("=== Init complete - Per-core isolation active ===");
-  HWSerial.println("Dashboard: http://<your-esp32-ip>/");
+  
 }
 void loop() {
   vTaskDelete(NULL);
