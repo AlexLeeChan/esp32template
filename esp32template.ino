@@ -269,51 +269,21 @@ void freeMessage(ExecMessage* msg) {
 }
 
 void updateCpuLoad() {
-  static uint32_t lastTotalRuntime = 0;
-  static uint32_t lastIdleRuntime[2] = { 0, 0 };
-
-  static TaskStatus_t statusArray[MAX_TASKS_MONITORED];
-  uint32_t totalRuntime;
-  UBaseType_t numTasks = uxTaskGetSystemState(statusArray, MAX_TASKS_MONITORED, &totalRuntime);
-
-  // Calculate delta - skip if too small to avoid division issues
-  uint32_t totalDelta = totalRuntime - lastTotalRuntime;
-  if (totalDelta < 100000) return;  // Skip if less than ~100ms elapsed
-
-  lastTotalRuntime = totalRuntime;
-
-  // Find IDLE tasks and calculate their percentage
-  for (UBaseType_t i = 0; i < numTasks; i++) {
-    String name = String(statusArray[i].pcTaskName);
-
-    if (name.equals("IDLE0") || name.equals("IDLE")) {
-      uint32_t idleDelta = statusArray[i].ulRunTimeCounter - lastIdleRuntime[0];
-      lastIdleRuntime[0] = statusArray[i].ulRunTimeCounter;
-
-      // Prevent division issues - calculate idle percentage safely
-      uint64_t perCoreDelta = (uint64_t)totalDelta;
-      if (NUM_CORES > 1) {
-        perCoreDelta = totalDelta / 2;  // Divide total time by number of cores
+  // This function now just copies the CPU load from the main monitor,
+  // which is already calculating it correctly for the "top_tasks" list.
+  // We just invert the IDLE task's percentage.
+  
+  // Find the IDLE0 task in our monitored data
+  for (uint8_t i = 0; i < taskCount; i++) {
+    if (taskData[i].name.equals("IDLE0") || (NUM_CORES == 1 && taskData[i].name.equals("IDLE"))) {
+      coreLoadPct[0] = (taskData[i].cpuPercent > 100) ? 0 : (100 - taskData[i].cpuPercent);
+    } 
+    
+    #if NUM_CORES > 1
+      else if (taskData[i].name.equals("IDLE1")) {
+        coreLoadPct[1] = (taskData[i].cpuPercent > 100) ? 0 : (100 - taskData[i].cpuPercent);
       }
-
-      if (perCoreDelta > 0) {
-        uint64_t idlePct = ((uint64_t)idleDelta * 100ULL) / perCoreDelta;
-        coreLoadPct[0] = (idlePct > 100) ? 0 : (100 - (uint8_t)idlePct);
-      }
-    } else if (name.equals("IDLE1")) {
-      uint32_t idleDelta = statusArray[i].ulRunTimeCounter - lastIdleRuntime[1];
-      lastIdleRuntime[1] = statusArray[i].ulRunTimeCounter;
-
-      uint64_t perCoreDelta = (uint64_t)totalDelta;
-      if (NUM_CORES > 1) {
-        perCoreDelta = totalDelta / 2;
-      }
-
-      if (perCoreDelta > 0) {
-        uint64_t idlePct = ((uint64_t)idleDelta * 100ULL) / perCoreDelta;
-        coreLoadPct[1] = (idlePct > 100) ? 0 : (100 - (uint8_t)idlePct);
-      }
-    }
+    #endif
   }
 }
 
