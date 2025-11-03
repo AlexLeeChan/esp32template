@@ -91,8 +91,8 @@ extern "C" void configureTimerForRunTimeStats(void) {
   runtimeOffsetUs = esp_timer_get_time();
 }
 
-extern "C" uint64_t ulGetRunTimeCounterValue(void) {
-  return (esp_timer_get_time() - runtimeOffsetUs);
+extern "C" uint32_t ulGetRunTimeCounterValue(void) {
+  return (uint32_t)(esp_timer_get_time() - runtimeOffsetUs);
 }
 
 // System configuration
@@ -866,7 +866,7 @@ void updateTaskMonitoring() {
   for (uint8_t i = 0; i < taskCount; i++) {
     bool found = false;
     for (uint8_t j = 0; j < numTasks; j++) {
-      if (taskData[i].name.equals(statusArray[j].pcTaskName)) {
+      if (taskData[i].handle == statusArray[j].xHandle) {
         uint32_t currentRuntime100ms = statusArray[j].ulRunTimeCounter;
         uint64_t taskDelta100ms = (uint64_t)currentRuntime100ms - taskData[i].prevRuntime;
         if (currentRuntime100ms < taskData[i].prevRuntime) {
@@ -927,7 +927,7 @@ void updateTaskMonitoring() {
   for (uint8_t j = 0; j < numTasks && taskCount < MAX_TASKS_MONITORED; j++) {
     bool exists = false;
     for (uint8_t i = 0; i < taskCount; i++) {
-      if (taskData[i].name.equals(statusArray[j].pcTaskName)) {
+      if (taskData[i].handle == statusArray[j].xHandle) {
         exists = true;
         break;
       }
