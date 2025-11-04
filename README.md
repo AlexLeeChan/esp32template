@@ -1,4 +1,5 @@
-# ESP32(x) WiFi & BLE Template
+# ESP32(x) WiFi & BLE Template 
+# Including BLE configuration web application - simple HTML 
 
 This project is a comprehensive, multi-featured template for building robust applications on the ESP32, ESP32-S3, ESP32-C3, and other variants. It provides a "scaffolding" that gives any new project instant, powerful diagnostics and control capabilities right out of the box.
 
@@ -109,3 +110,69 @@ This project is designed as a template. You add your code primarily to `bizTask`
 2.  **Process Messages:** In `bizTask`, add logic to parse the `msg->payload` (a C string) that you receive from the queue.
 3.  **Send Commands:** Use the Web UI "Command Exec" box or the `/api/exec` endpoint to send test commands to your task.
 4.  **Build:** Your application now automatically has a web dashboard, BLE control, and deep performance monitoring.
+
+# Universal BLE WiFi Configurator PWA
+
+This is a single-file, zero-dependency Progressive Web App (PWA) for configuring the WiFi settings on virtually any BLE-enabled device (like an ESP32, nRF, etc.).
+
+The entire application—HTML, CSS (via Tailwind CDN), JavaScript, PWA Manifest, and Service Worker—is contained within this single `index.html` file. This makes it incredibly easy to deploy by simply hosting it on any web server or even using it from a local copy.
+
+
+
+## ✨ Key Features
+
+* **Single-File Application:** No build steps, no `npm install`. Just serve or open the file.
+* **Truly Universal:** Automatically discovers the first available `write` (RX) and `notify` (TX) characteristics on *any* BLE device. It does not require specific service or characteristic UUIDs.
+* **PWA Ready:** Can be "Added to Home Screen" on iOS and Android for a native-app-like experience, complete with an icon and offline caching.
+* **Full WiFi Control:**
+    * Set SSID and Password.
+    * Configure for DHCP (Automatic IP).
+    * Configure a Static IP, Gateway, Subnet, and DNS.
+* **Robust Communication:** Includes a JavaScript command queue to prevent "GATT operation already in progress" errors.
+* **Modern UI:** Clean, responsive interface built with Tailwind CSS (via CDN).
+* **Live Status & Logging:** Features a real-time activity log and WiFi status display.
+
+## 🚀 How to Use
+
+1.  Save this `index.html` file.
+2.  Open it in a compatible browser:
+    * **Android:** Chrome
+    * **iOS (16.4+):** Safari (Web BLE is supported)
+    * **iOS (older):** [Bluefy](https://apps.apple.com/us/app/bluefy-web-ble-browser/id1492822055)
+    * **Desktop:** Chrome, Edge, or Opera.
+3.  Click **Connect BLE** and select your device from the popup.
+4.  Once connected, the app will enable the input fields.
+5.  Enter your WiFi credentials, configure IP settings, and click **Configure**.
+
+## 펌 Firmware API Contract
+
+To make your hardware compatible with this app, your BLE device (e.g., ESP32) must implement the following simple, newline-terminated (`\n`) string protocol.
+
+### ➡️ Commands (App to Device)
+
+The app sends these commands to your device's `write` characteristic:
+
+* `GET_STATUS`: Request the current WiFi status.
+* `SET_WIFI|ssid|password`: Set the WiFi credentials. `password` can be blank to keep a previously saved one.
+* `SET_IP|DHCP`: Configure the device to use DHCP.
+* `SET_IP|STATIC|ip|gateway|subnet|dns`: Configure a static IP.
+* `DISCONNECT`: Command the device to disconnect from the current WiFi network.
+* `CLEAR_WIFI`: Command the device to clear all saved WiFi credentials.
+
+### ⬅️ Responses (Device to App)
+
+Your device must send these pipe-delimited (`|`) strings to the app via its `notify` characteristic:
+
+* **Main Status Response:**
+    * `STATUS|state|ssid|ip|rssi|ip_mode|static_ip`
+    * **Example (Connected):** `STATUS|CONNECTED|MyNetwork|192.168.1.50|-65|STATIC|192.168.1.50`
+    * **Example (Disconnected):** `STATUS|DISCONNECTED||||DHCP|`
+
+* **Quick Status Updates:**
+    * `CONNECTED|ip`: Sent right after a successful connection.
+    * `DISCONNECTED`: Sent after a disconnection.
+    * `CONNECTING`: Sent while attempting to connect.
+
+* **Acknowledgements:**
+    * `OK:Message`: A generic success message (e.g., `OK:WIFI_CLEARED`).
+    * `ERR:Message`: A generic error message (e.g., `ERR:INVALID_IP`).
