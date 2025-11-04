@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>BLE WiFi Configurator</title>
+  <meta name="theme-color" content="#2563EB"/>
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link id="inline-manifest" rel="manifest">
+  <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect fill='%232563EB' width='100' height='100' rx='20'/%3E%3Ctext x='50' y='65' font-family='Arial' font-size='45' font-weight='bold' fill='white' text-anchor='middle'%3EESP%3C/text%3E%3C/svg%3E">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    input, input::placeholder { text-transform: none !important; }
+    .esp-icon { stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen p-4">
+  <div class="max-w-2xl mx-auto">
+    <div class="bg-white rounded-2xl shadow-xl overflow-hidden">
+      
+      <!-- ==================== HEADER SECTION ==================== -->
+      <div class="bg-gradient-to-r from-blue-600 to-indigo-600 p-6 text-white">
+        <h1 class="text-3xl font-bold flex items-center gap-3">
+          <!-- ESP32 Chip Icon -->
+          <svg class="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <rect x="3" y="6" width="18" height="12" rx="2" class="esp-icon"/>
+            <path d="M7 9h2M7 12h2M7 15h2M15 9h2M15 12h2M15 15h2" class="esp-icon"/>
+            <circle cx="12" cy="12" r="1.5" fill="currentColor"/>
+          </svg>
+          ESP32 WiFi Setup
+        </h1>
+        <p class="mt-2 opacity-90 flex items-center gap-2" id="platform-text">Universal BLE Configuration</p>
+      </div>
+
+      <!-- ==================== CONNECTION STATUS SECTION ==================== -->
+      <div class="p-6 border-b bg-gray-50">
+        <!-- Bluetooth Connection Controls -->
+        <div class="flex items-center justify-between mb-4">
+          <div class="flex items-center gap-3">
+            <div id="bt-indicator" class="w-4 h-4 rounded-full bg-red-500"></div>
+            <span class="font-semibold" id="bt-status-text">Bluetooth: Disconnected</span>
+          </div>
+          <div class="flex gap-2">
+            <button id="btn-connect" class="px-5 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-md">
+              Connect BLE
+            </button>
+            <button id="btn-disconnect" class="px-5 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition font-medium hidden">
+              Disconnect
+            </button>
+          </div>
+        </div>
+
+        <!-- Connected Device Information Card -->
+        <div id="device-info-card" class="p-4 bg-blue-50 rounded-lg border-2 border-blue-100 mb-4 hidden">
+          <div class="flex items-center gap-2">
+            <!-- Chip Icon -->
+            <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <rect x="5" y="5" width="14" height="14" rx="1" class="esp-icon"/>
+              <path d="M5 9h14M5 15h14M9 5v14M15 5v14" class="esp-icon"/>
+            </svg>
+            <span class="font-semibold">Connected Device:</span>
+            <span class="font-medium text-blue-600" id="device-name">Unknown</span>
+          </div>
+        </div>
+
+        <!-- WiFi Status Information Card -->
+        <div id="wifi-status-card" class="p-4 bg-white rounded-lg border-2 border-blue-100 hidden">
+          <div class="flex items-center gap-2 mb-2">
+            <!-- WiFi Icon -->
+            <svg class="w-5 h-5 text-gray-400" id="wifi-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path d="M12 20h.01M8.5 16.5a5 5 0 017 0M5 13a10 10 0 0114 0M1.42 9.42a14 14 0 0121.16 0" class="esp-icon"/>
+            </svg>
+            <span class="font-semibold">WiFi Status:</span>
+            <span class="font-medium text-gray-600" id="wifi-status">Unknown</span>
+          </div>
+          <!-- IP Address Display -->
+          <div id="ip-display" class="text-sm text-gray-700 ml-7 hidden">
+            <span class="font-medium">IP:</span>
+            <a href="#" target="_blank" id="ip-address" class="font-mono bg-gray-100 px-2 py-1 rounded text-blue-600 hover:underline" title="Open device in browser"></a>
+          </div>
+          <!-- Signal Strength Display -->
+          <div id="rssi-display" class="text-sm text-gray-700 ml-7 mt-1 hidden">
+            <span class="font-medium">Signal:</span> <span class="font-mono bg-gray-100 px-2 py-1 rounded" id="rssi-value"></span>
+          </div>
+          <!-- IP Mode Display -->
+          <div id="ip-mode-display" class="text-sm text-gray-700 ml-7 mt-1 hidden">
+            <span class="font-medium">IP Mode:</span> <span class="font-mono bg-gray-100 px-2 py-1 rounded" id="ip-mode"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ==================== WIFI CONFIGURATION SECTION ==================== -->
+      <div class="p-6 border-b">
+        <h2 class="text-xl font-bold mb-4 flex items-center gap-2">
+          <!-- Network Icon -->
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path d="M12 20h.01M8.5 16.5a5 5 0 017 0M5 13a10 10 0 0114 0M1.42 9.42a14 14 0 0121.16 0" class="esp-icon"/>
+          </svg>
+          WiFi Configuration
+        </h2>
+
+        <div class="space-y-4">
+          <!-- SSID Input -->
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-2">Network Name (SSID) *</label>
+            <input
+              type="text"
+              id="input-ssid"
+              placeholder="Enter WiFi network name"
+              class="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+              disabled
+              autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false" inputmode="text"
+            />
+          </div>
+
+          <!-- Password Input -->
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-2">Password</label>
+            <input
+              type="password"
+              id="input-password"
+              placeholder="(leave blank to keep saved password)"
+              class="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+              disabled
+              autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false"
+            />
+          </div>
+
+          <!-- ==================== IP CONFIGURATION SECTION ==================== -->
+          <div class="border-t pt-4">
+            <h3 class="text-lg font-bold mb-3 flex items-center gap-2">
+              <!-- Settings Icon -->
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="3" class="esp-icon"/>
+                <path d="M12 1v6m0 6v6M23 12h-6m-6 0H5" class="esp-icon"/>
+                <path d="M18.36 5.64l-4.24 4.24m0 4.24l4.24 4.24M5.64 5.64l4.24 4.24m0 4.24l-4.24 4.24" class="esp-icon" opacity="0.5"/>
+              </svg>
+              IP Address Configuration
+            </h3>
+
+            <!-- DHCP Checkbox -->
+            <div class="mb-4">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" id="use-dhcp" class="w-5 h-5 text-blue-600 rounded focus:ring-blue-500" checked disabled>
+                <span class="font-medium">Use DHCP (Automatic IP)</span>
+              </label>
+            </div>
+
+            <!-- Static IP Configuration Fields -->
+            <div id="static-ip-config" class="space-y-3 hidden">
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">Static IP *</label>
+                  <input type="text" id="static-ip" placeholder="192.168.1.100" class="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">Gateway *</label>
+                  <input type="text" id="gateway" placeholder="192.168.1.1" class="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">Subnet Mask (optional)</label>
+                  <input type="text" id="subnet" placeholder="255.255.255.0" class="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">DNS Server (optional)</label>
+                  <input type="text" id="dns" placeholder="8.8.8.8" class="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ==================== ACTION BUTTONS ==================== -->
+          <!-- Primary Action Buttons -->
+          <div class="grid grid-cols-2 gap-3">
+            <button
+              id="btn-configure"
+              disabled
+              class="px-4 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium shadow-md"
+            >
+              <!-- Check Icon -->
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path d="M5 13l4 4L19 7" class="esp-icon"/>
+              </svg>
+              Configure
+            </button>
+
+            <button
+              id="btn-status"
+              disabled
+              class="px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium shadow-md"
+            >
+              <!-- Refresh Icon -->
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path d="M4 4v5h5M20 20v-5h-5" class="esp-icon"/>
+                <path d="M4 9a9 9 0 019-5 9 9 0 019 9M20 15a9 9 0 01-9 5 9 9 0 01-9-9" class="esp-icon"/>
+              </svg>
+              Status
+            </button>
+          </div>
+
+          <!-- Secondary Action Buttons -->
+          <div class="grid grid-cols-2 gap-3">
+            <button
+              id="btn-disconnect-wifi"
+              disabled
+              class="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+            >
+              Disconnect WiFi
+            </button>
+
+            <button
+              id="btn-clear"
+              disabled
+              class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+            >
+              Clear Saved
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ==================== ACTIVITY LOG SECTION ==================== -->
+      <div class="p-6">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-xl font-bold">Activity Log</h2>
+          <button id="btn-clear-log" class="text-sm text-gray-500 hover:text-gray-700 transition">Clear</button>
+        </div>
+        <div id="log-container" class="bg-gray-900 text-gray-100 rounded-lg p-4 h-64 overflow-y-auto font-mono text-sm">
+          <div class="text-gray-500 text-center py-8">
+            No activity yet. Connect to a BLE device to start.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== INSTRUCTIONS SECTION ==================== -->
+    <div class="mt-6 bg-white rounded-lg shadow-lg p-6">
+      <h3 class="font-bold text-lg mb-3 flex items-center gap-2">
+        <!-- Info Icon -->
+        <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10" class="esp-icon"/>
+          <path d="M12 16v-4M12 8h.01" class="esp-icon"/>
+        </svg>
+        Setup Instructions
+      </h3>
+      <div class="space-y-3 text-sm text-gray-700">
+        <div class="flex gap-3">
+          <span class="font-bold text-blue-600 min-w-[20px]">1.</span>
+          <span><strong>Android:</strong> Use Chrome | <strong>iOS:</strong> Use Safari 16.4+ or Bluefy</span>
+        </div>
+        <div class="flex gap-3">
+          <span class="font-bold text-blue-600 min-w-[20px]">2.</span>
+          <span>Click "Connect BLE" and select any Bluetooth device from the list</span>
+        </div>
+        <div class="flex gap-3">
+          <span class="font-bold text-blue-600 min-w-[20px]">3.</span>
+          <span>Enter your WiFi credentials</span>
+        </div>
+        <div class="flex gap-3">
+          <span class="font-bold text-blue-600 min-w-[20px]">4.</span>
+          <span>Choose DHCP or configure a static IP address</span>
+        </div>
+        <div class="flex gap-3">
+          <span class="font-bold text-blue-600 min-w-[20px]">5.</span>
+          <span>Click "Configure" - Device will connect and display its IP</span>
+        </div>
+      </div>
+      <div class="mt-4 p-3 bg-blue-50 rounded-lg border border-blue-200 text-xs text-blue-800">
+        <strong>Compatibility:</strong> Works with any BLE device that exposes at least one writable and one notifiable characteristic. 
+        The app will automatically discover and use the appropriate GATT characteristics.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /* ========================================
+       GLOBAL VARIABLES & STATE MANAGEMENT
+    ======================================== */
+    var device = null;
+    var gattServer = null;
+    var rxCharacteristic = null;
+    var txCharacteristic = null;
+    var isConnected = false;
+
+    /* ========================================
+       COMMAND QUEUE SYSTEM
+       Prevents "GATT operation already in progress" errors
+    ======================================== */
+    var cmdQueue = [];
+    var queueBusy = false;
+
+    function enqueue(command) {
+      cmdQueue.push(command);
+      processQueue();
+    }
+
+    async function processQueue() {
+      if (queueBusy || !rxCharacteristic) return;
+      queueBusy = true;
+      
+      while (cmdQueue.length > 0) {
+        var cmd = cmdQueue.shift();
+        try {
+          var encoder = new TextEncoder();
+          var data = encoder.encode(cmd + '\n');
+
+          if (rxCharacteristic.properties && rxCharacteristic.properties.writeWithoutResponse && rxCharacteristic.writeValueWithoutResponse) {
+            await rxCharacteristic.writeValueWithoutResponse(data);
+          } else {
+            await rxCharacteristic.writeValue(data);
+          }
+
+          addLog('> ' + cmd, 'send');
+          await delay(120);
+        } catch (e) {
+          addLog('Send error: ' + (e.message || e), 'error');
+          var msg = String(e && e.message ? e.message : '').toLowerCase();
+          if (msg.indexOf('in progress') !== -1) {
+            await delay(200);
+            cmdQueue.unshift(cmd);
+          }
+        }
+      }
+      queueBusy = false;
+    }
+
+    var delay = function (ms) { return new Promise(function(r){ setTimeout(r, ms); }); };
+
+    /* ========================================
+       PLATFORM DETECTION
+    ======================================== */
+    (function detectPlatform() {
+      var ua = navigator.userAgent.toLowerCase();
+      var platform = 'Desktop';
+      if (ua.indexOf('iphone') !== -1 || ua.indexOf('ipad') !== -1) platform = 'iOS';
+      else if (ua.indexOf('android') !== -1) platform = 'Android';
+      document.getElementById('platform-text').textContent = 'Universal BLE Configuration | Device: ' + platform;
+    })();
+
+    /* ========================================
+       UI ELEMENT REFERENCES
+    ======================================== */
+    var btnConnect = document.getElementById('btn-connect');
+    var btnDisconnect = document.getElementById('btn-disconnect');
+    var btnConfigure = document.getElementById('btn-configure');
+    var btnStatus = document.getElementById('btn-status');
+    var btnDisconnectWifi = document.getElementById('btn-disconnect-wifi');
+    var btnClear = document.getElementById('btn-clear');
+    var btnClearLog = document.getElementById('btn-clear-log');
+
+    var inputSsid = document.getElementById('input-ssid');
+    var inputPassword = document.getElementById('input-password');
+
+    var useDHCP = document.getElementById('use-dhcp');
+    var staticIPConfig = document.getElementById('static-ip-config');
+    var staticIP = document.getElementById('static-ip');
+    var gateway = document.getElementById('gateway');
+    var subnet = document.getElementById('subnet');
+    var dns = document.getElementById('dns');
+
+    inputSsid.setAttribute('autocapitalize', 'none');
+    inputSsid.setAttribute('autocomplete', 'off');
+    inputSsid.setAttribute('autocorrect', 'off');
+    inputSsid.setAttribute('spellcheck', 'false');
+
+    /* ========================================
+       EVENT LISTENERS SETUP
+    ======================================== */
+    btnConnect.addEventListener('click', connectBluetooth);
+    btnDisconnect.addEventListener('click', disconnectBluetooth);
+    btnConfigure.addEventListener('click', configureWifi);
+    btnStatus.addEventListener('click', function(){ enqueue('GET_STATUS'); });
+    btnDisconnectWifi.addEventListener('click', function(){
+      enqueue('DISCONNECT');
+      addLog('Disconnecting WiFi...', 'info');
+      setTimeout(function(){ enqueue('GET_STATUS'); }, 1200);
+    });
+    btnClear.addEventListener('click', clearWifi);
+    btnClearLog.addEventListener('click', function(){
+      document.getElementById('log-container').innerHTML = '<div class="text-gray-500 text-center py-8">Log cleared.</div>';
+    });
+
+    useDHCP.addEventListener('change', function(e){
+      staticIPConfig.classList.toggle('hidden', e.target.checked);
+    });
+
+    /* ========================================
+       BLUETOOTH CONNECTION HANDLER
+       Accepts ALL BLE devices (no name filtering)
+    ======================================== */
+    async function connectBluetooth() {
+      if (!navigator.bluetooth) {
+        addLog('Web Bluetooth not supported in this browser', 'error');
+        alert('Use Chrome on Android or Safari 16.4+ on iOS.');
+        return;
+      }
+      
+      try {
+        addLog('Requesting Bluetooth device...');
+        
+        device = await navigator.bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: []
+        });
+
+        addLog('Found device: ' + (device.name || 'Unknown Device'), 'success');
+        
+        document.getElementById('device-name').textContent = device.name || 'Unknown Device';
+        document.getElementById('device-info-card').classList.remove('hidden');
+        
+        addLog('Connecting to GATT server...');
+        gattServer = await device.gatt.connect();
+        addLog('GATT server connected', 'success');
+
+        await discoverGattCharacteristics();
+
+        if (!rxCharacteristic || !txCharacteristic) {
+          throw new Error('Suitable RX/TX characteristics not found. Ensure one writable and one notifiable/indicatable characteristic are exposed.');
+        }
+
+        await txCharacteristic.startNotifications();
+        txCharacteristic.addEventListener('characteristicvaluechanged', handleNotification);
+
+        isConnected = true;
+        updateUI();
+        addLog('Bluetooth connected & GATT discovered', 'success');
+
+        device.addEventListener('gattserverdisconnected', function () {
+          isConnected = false;
+          updateUI();
+          addLog('Device disconnected', 'error');
+          document.getElementById('device-info-card').classList.add('hidden');
+        });
+
+        enqueue('GET_STATUS');
+        inputPassword.placeholder = '******** (kept if left blank)';
+
+      } catch (error) {
+        addLog('Connection failed: ' + (error && error.message ? error.message : error), 'error');
+        console.error(error);
+      }
+    }
+
+    /* ========================================
+       GATT CHARACTERISTICS DISCOVERY
+       Dynamically finds suitable RX/TX characteristics
+    ======================================== */
+    async function discoverGattCharacteristics() {
+      rxCharacteristic = null;
+      txCharacteristic = null;
+
+      var services = await gattServer.getPrimaryServices();
+      addLog('Discovered ' + services.length + ' primary service(s)', 'info');
+
+      var candidatePairs = [];
+      
+      for (var i = 0; i < services.length; i++) {
+        var svc = services[i];
+        var chars = [];
+        try {
+          chars = await svc.getCharacteristics();
+        } catch (e) {
+          continue;
+        }
+
+        var localRx = null, localTx = null;
+        for (var j = 0; j < chars.length; j++) {
+          var ch = chars[j];
+          var p = ch.properties || {};
+          if (!localRx && (p.writeWithoutResponse || p.write)) localRx = ch;
+          if (!localTx && (p.notify || p.indicate)) localTx = ch;
+        }
+
+        if (localRx && localTx) {
+          candidatePairs.push({ rx: localRx, tx: localTx, score: 2 });
+        } else {
+          for (var k = 0; k < chars.length; k++) {
+            var ch2 = chars[k];
+            var p2 = ch2.properties || {};
+            if (p2.writeWithoutResponse || p2.write) candidatePairs.push({ rx: ch2, tx: null, score: 1 });
+            if (p2.notify || p2.indicate)          candidatePairs.push({ rx: null, tx: ch2, score: 1 });
+          }
+        }
+      }
+
+      var sameService = null;
+      for (var s = 0; s < candidatePairs.length; s++) {
+        if (candidatePairs[s].score === 2) { sameService = candidatePairs[s]; break; }
+      }
+      
+      if (sameService) {
+        rxCharacteristic = sameService.rx;
+        txCharacteristic = sameService.tx;
+        addLog('Matched RX/TX in the same service', 'info');
+        return;
+      }
+
+      var anyRx = null, anyTx = null;
+      for (var a = 0; a < candidatePairs.length; a++) {
+        if (!anyRx && candidatePairs[a].rx && !candidatePairs[a].tx) anyRx = candidatePairs[a].rx;
+        if (!anyTx && candidatePairs[a].tx && !candidatePairs[a].rx) anyTx = candidatePairs[a].tx;
+        if (anyRx && anyTx) break;
+      }
+      
+      if (anyRx && anyTx) {
+        rxCharacteristic = anyRx;
+        txCharacteristic = anyTx;
+        addLog('Matched RX/TX across different services', 'info');
+      }
+    }
+
+    /* ========================================
+       BLUETOOTH DISCONNECT HANDLER
+    ======================================== */
+    function disconnectBluetooth() {
+      try { 
+        if (device && device.gatt && device.gatt.connected) device.gatt.disconnect(); 
+      } catch (e) {}
+      
+      isConnected = false;
+      updateUI();
+      addLog('Bluetooth disconnected');
+      document.getElementById('device-info-card').classList.add('hidden');
+    }
+
+    /* ========================================
+       BLE NOTIFICATION HANDLER
+       Processes incoming messages from ESP32
+    ======================================== */
+    function handleNotification(event) {
+      var dv = event.target && event.target.value ? event.target.value : null;
+      var value = '';
+      if (dv && dv.buffer) value = new TextDecoder().decode(dv);
+      addLog('< ' + value, 'receive');
+
+      var parts = value.split('|');
+      var tag = parts[0] || '';
+
+      if (tag === 'CONNECTED' && parts[1]) {
+        updateWifiStatus('CONNECTED', 'green', parts[1]);
+      } else if (tag === 'DISCONNECTED') {
+        updateWifiStatus('DISCONNECTED', 'red');
+      } else if (tag === 'CONNECTING') {
+        updateWifiStatus('Connecting...', 'yellow');
+      } else if (tag === 'STATUS') {
+        var state = parts[1] || 'Unknown';
+        var ssid = parts[2] || '';
+        var ip = parts[3] || '';
+        var rssi = parts[4] || '';
+        var ipMode = parts[5] || '';
+        var staticIPAddr = parts[6] || '';
+
+        if (ssid) inputSsid.value = ssid;
+        inputPassword.placeholder = '******** (kept if left blank)';
+
+        updateWifiStatus(state, state === 'CONNECTED' ? 'green' : 'gray', ip, rssi, ipMode);
+
+        if (ipMode.toUpperCase() === 'DHCP') {
+          useDHCP.checked = true;
+          staticIPConfig.classList.add('hidden');
+        } else if (ipMode.toUpperCase() === 'STATIC') {
+          useDHCP.checked = false;
+          staticIPConfig.classList.remove('hidden');
+          if (staticIPAddr) staticIP.value = staticIPAddr;
+        }
+      } else if (tag === 'ERROR' || tag.startsWith('ERR:')) {
+        addLog('Error: ' + (parts[1] || value.substring(4)), 'error');
+      } else if (tag === 'OK' || tag.startsWith('OK:')) {
+        addLog((parts[1] || value.substring(3)) || 'OK', 'success');
+      }
+    }
+
+    /* ========================================
+       WIFI CONFIGURATION FUNCTION
+    ======================================== */
+    function configureWifi() {
+      var ssid = inputSsid.value.trim();
+      var password = inputPassword.value;
+      
+      if (!ssid) {
+        addLog('Please enter SSID', 'error');
+        return;
+      }
+
+      var isDHCP = useDHCP.checked;
+      enqueue('SET_WIFI|' + ssid + '|' + password);
+
+      if (isDHCP) {
+        enqueue('SET_IP|DHCP');
+        addLog('Configuring WiFi with DHCP...', 'info');
+      } else {
+        var sip = staticIP.value.trim();
+        var gw  = gateway.value.trim();
+        var sub = subnet.value.trim();
+        var dval = dns.value.trim();
+
+        if (!sip || !gw) {
+          addLog('Static IP and Gateway are required', 'error');
+          return;
+        }
+        if (!sub) sub = '255.255.255.0';
+        if (!dval) dval = '8.8.8.8';
+
+        if (!isIPv4(sip) || !isIPv4(gw) || !isIPv4(sub) || !isIPv4(dval)) {
+          addLog('Invalid IP field. Check IP/Gateway/Subnet/DNS', 'error');
+          return;
+        }
+
+        enqueue('SET_IP|STATIC|' + [sip, gw, sub, dval].join('|'));
+        addLog('Configuring WiFi with Static IP...', 'info');
+      }
+
+      setTimeout(function(){ enqueue('GET_STATUS'); }, 1500);
+    }
+
+    /* ========================================
+       CLEAR WIFI CREDENTIALS FUNCTION
+    ======================================== */
+    function clearWifi() {
+      if (confirm('Clear saved WiFi credentials on device?')) {
+        enqueue('CLEAR_WIFI');
+        inputSsid.value = '';
+        inputPassword.value = '';
+        staticIP.value = '';
+        gateway.value = '';
+        subnet.value = '';
+        dns.value = '';
+        setTimeout(function(){ enqueue('GET_STATUS'); }, 1000);
+      }
+    }
+
+    /* ========================================
+       VALIDATION FUNCTIONS
+    ======================================== */
+    function isIPv4(s) {
+      var parts = s.split('.');
+      if (parts.length !== 4) return false;
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i];
+        if (p === '' || !/^\d{1,3}$/.test(p)) return false;
+        var n = Number(p);
+        if (n < 0 || n > 255) return false;
+      }
+      return true;
+    }
+
+    /* ========================================
+       UI UPDATE FUNCTIONS
+    ======================================== */
+    function updateUI() {
+      var indicator = document.getElementById('bt-indicator');
+      var statusText = document.getElementById('bt-status-text');
+      var wifiCard = document.getElementById('wifi-status-card');
+
+      if (isConnected) {
+        indicator.className = 'w-4 h-4 rounded-full bg-green-500 animate-pulse';
+        statusText.textContent = 'Bluetooth: Connected';
+        btnConnect.classList.add('hidden');
+        btnDisconnect.classList.remove('hidden');
+        wifiCard.classList.remove('hidden');
+
+        inputSsid.disabled = false;
+        inputPassword.disabled = false;
+        useDHCP.disabled = false;
+        staticIP.disabled = false;
+        gateway.disabled = false;
+        subnet.disabled = false;
+        dns.disabled = false;
+        btnConfigure.disabled = false;
+        btnStatus.disabled = false;
+        btnDisconnectWifi.disabled = false;
+        btnClear.disabled = false;
+      } else {
+        indicator.className = 'w-4 h-4 rounded-full bg-red-500';
+        statusText.textContent = 'Bluetooth: Disconnected';
+        btnConnect.classList.remove('hidden');
+        btnDisconnect.classList.add('hidden');
+        wifiCard.classList.add('hidden');
+
+        inputSsid.disabled = true;
+        inputPassword.disabled = true;
+        useDHCP.disabled = true;
+        staticIP.disabled = true;
+        gateway.disabled = true;
+        subnet.disabled = true;
+        dns.disabled = true;
+        btnConfigure.disabled = true;
+        btnStatus.disabled = true;
+        btnDisconnectWifi.disabled = true;
+        btnClear.disabled = true;
+      }
+    }
+
+    function updateWifiStatus(status, color, ip, rssi, ipMode) {
+      if (ip === void 0) ip = '';
+      if (rssi === void 0) rssi = '';
+      if (ipMode === void 0) ipMode = '';
+
+      var wifiStatus = document.getElementById('wifi-status');
+      var wifiIcon = document.getElementById('wifi-icon');
+      var ipDisplay = document.getElementById('ip-display');
+      var rssiDisplay = document.getElementById('rssi-display');
+      var ipModeDisplay = document.getElementById('ip-mode-display');
+      var ipAddress = document.getElementById('ip-address');
+      var rssiValue = document.getElementById('rssi-value');
+      var ipModeText = document.getElementById('ip-mode');
+
+      wifiStatus.textContent = status;
+
+      var colorMap = { 
+        green: 'text-green-600', 
+        yellow: 'text-yellow-600', 
+        red: 'text-red-600', 
+        gray: 'text-gray-600' 
+      };
+      
+      wifiStatus.className = 'font-medium ' + (colorMap[color] || 'text-gray-600');
+      wifiIcon.className = 'w-5 h-5 ' + (color === 'green' ? 'text-green-600' : 'text-gray-400');
+
+      if (ip) {
+        ipAddress.textContent = ip;
+        ipAddress.href = 'http://' + ip;
+        ipDisplay.classList.remove('hidden');
+      } else {
+        ipDisplay.classList.add('hidden');
+      }
+
+      if (rssi) { 
+        rssiValue.textContent = rssi + ' dBm'; 
+        rssiDisplay.classList.remove('hidden'); 
+      } else { 
+        rssiDisplay.classList.add('hidden'); 
+      }
+
+      if (ipMode) { 
+        ipModeText.textContent = ipMode; 
+        ipModeDisplay.classList.remove('hidden'); 
+      } else { 
+        ipModeDisplay.classList.add('hidden'); 
+      }
+    }
+
+    /* ========================================
+       ACTIVITY LOG FUNCTION
+    ======================================== */
+    function addLog(message, type) {
+      if (type === void 0) type = 'info';
+      
+      var container = document.getElementById('log-container');
+      var timestamp = new Date().toLocaleTimeString();
+      var colorMap = {
+        error: 'text-red-400',
+        success: 'text-green-400',
+        send: 'text-blue-300',
+        receive: 'text-yellow-300',
+        info: 'text-gray-300'
+      };
+
+      if (container.children.length === 1 && container.children[0].textContent.indexOf('No activity') !== -1) {
+        container.innerHTML = '';
+      }
+
+      var logEntry = document.createElement('div');
+      logEntry.className = colorMap[type] || 'text-gray-300';
+      logEntry.innerHTML = '<span class="text-gray-500">[' + timestamp + ']</span> ' + message;
+
+      container.appendChild(logEntry);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    /* ========================================
+       PWA (PROGRESSIVE WEB APP) SETUP
+    ======================================== */
+    (function setupPWA(){
+      var manifest = {
+        name: "ESP32 WiFi Configurator",
+        short_name: "ESP32 WiFi",
+        start_url: "./index.html",
+        display: "standalone",
+        background_color: "#F9FAFB",
+        theme_color: "#2563EB",
+        icons: [
+          { 
+            src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%232563EB' width='192' height='192' rx='40'/%3E%3Ctext x='96' y='130' font-family='Arial' font-size='90' font-weight='bold' fill='white' text-anchor='middle'%3EESP%3C/text%3E%3C/svg%3E", 
+            sizes: "192x192", 
+            type: "image/svg+xml" 
+          },
+          { 
+            src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect fill='%232563EB' width='512' height='512' rx='100'/%3E%3Ctext x='256' y='350' font-family='Arial' font-size='240' font-weight='bold' fill='white' text-anchor='middle'%3EESP%3C/text%3E%3C/svg%3E", 
+            sizes: "512x512", 
+            type: "image/svg+xml" 
+          }
+        ]
+      };
+      
+      var manifestLink = document.getElementById('inline-manifest');
+      var manifestBlob = new Blob([JSON.stringify(manifest)], {type: 'application/json'});
+      manifestLink.href = URL.createObjectURL(manifestBlob);
+
+      if ('serviceWorker' in navigator) {
+        var swLines = [
+          "const CACHE_NAME = 'esp32-wifi-pwa-v1';",
+          "const FILES_TO_CACHE = ['.', './index.html'];",
+          "self.addEventListener('install', function(e){",
+          "  e.waitUntil(caches.open(CACHE_NAME).then(function(c){ return c.addAll(FILES_TO_CACHE); }));",
+          "});",
+          "self.addEventListener('activate', function(e){",
+          "  e.waitUntil(caches.keys().then(function(keys){",
+          "    return Promise.all(keys.map(function(k){ if (k !== CACHE_NAME) { return caches.delete(k); } }));",
+          "  }));",
+          "});",
+          "self.addEventListener('fetch', function(e){",
+          "  e.respondWith(caches.match(e.request).then(function(r){ return r || fetch(e.request); }));",
+          "});"
+        ];
+        var swCode = swLines.join('\n');
+        var swBlob = new Blob([swCode], { type: 'text/javascript' });
+        var swUrl = URL.createObjectURL(swBlob);
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register(swUrl).catch(function(err){ console.warn(err); });
+        });
+      }
+    })();
+
+    updateUI();
+  </script>
+</body>
+</html>
