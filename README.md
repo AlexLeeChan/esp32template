@@ -1,12 +1,13 @@
 # ESP32(x) WiFi & BLE Template 
-# Including BLE configuration web application - simple HTML 
+# Including BLE configuration application as simple HTML file 
 
-This project is a comprehensive, multi-featured template for building robust applications on the ESP32, ESP32-S3, ESP32-C3, and other variants. It provides a "scaffolding" that gives any new project instant, powerful diagnostics and control capabilities right out of the box.
+This project is a comprehensive, RTOS template for building robust applications on the ESP32, ESP32-S3, ESP32-C3, ESP32-C6 and other variants. 
+Wifi can be set through BLE Bluetooth application just from your browser! Just open included webpage in browser on Bluetooth device such as your Android/IOS phone.
 
 The core idea is to separate your custom "business logic" (in its own task) from the system's management, networking, and monitoring tasks. The template provides:
 
 1.  A **Web Dashboard** for monitoring and configuration.
-2.  A **BLE (Bluetooth Low Energy)** command interface for control.
+2.  A **BLE (Bluetooth Low Energy)** command interface for control. Primarily for intital Wifi SSID and Password setup.
 3.  A detailed **Per-Core FreeRTOS Task Monitor** to debug performance.
 4.  A **Robust Multi-Task RTOS skeleton** with watchdog support.
 
