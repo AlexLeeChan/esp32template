@@ -3,27 +3,52 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>BLE WiFi Configurator</title>
+  <title>ESP32 WiFi Setup</title>
   <meta name="theme-color" content="#2563EB"/>
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="ESP32 WiFi">
   <link id="inline-manifest" rel="manifest">
-  <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect fill='%232563EB' width='100' height='100' rx='20'/%3E%3Ctext x='50' y='65' font-family='Arial' font-size='45' font-weight='bold' fill='white' text-anchor='middle'%3EESP%3C/text%3E%3C/svg%3E">
+  <link rel="icon" type="image/png" sizes="192x192" id="icon-192">
+  <link rel="icon" type="image/png" sizes="512x512" id="icon-512">
+  <link rel="apple-touch-icon" id="apple-icon">
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     input, input::placeholder { text-transform: none !important; }
     .esp-icon { stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
   </style>
 </head>
-<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen p-4">
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen p-2">
+
+  <div id="pwa-install-bar" class="hidden fixed bottom-0 left-0 right-0 bg-blue-600 text-white p-3 z-50 shadow-lg">
+    <div class="max-w-2xl mx-auto flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+        </svg>
+        <div>
+          <div class="font-semibold text-sm">Install ESP32 WiFi Setup</div>
+          <div class="text-xs opacity-90">Works offline, faster access</div>
+        </div>
+      </div>
+      <div class="flex gap-2">
+        <button id="btn-pwa-dismiss" class="px-3 py-1 text-white hover:bg-blue-700 rounded transition text-sm">
+          Later
+        </button>
+        <button id="btn-pwa-install" class="px-4 py-1 bg-white text-blue-600 rounded hover:bg-blue-50 transition font-semibold text-sm">
+          Install
+        </button>
+      </div>
+    </div>
+  </div>
+  <style> body { padding-bottom: 5.5rem; } </style>
+  
   <div class="max-w-2xl mx-auto">
     <div class="bg-white rounded-2xl shadow-xl overflow-hidden">
       
-      <!-- ==================== HEADER SECTION ==================== -->
-      <div class="bg-gradient-to-r from-blue-600 to-indigo-600 p-6 text-white">
+      <div class="bg-gradient-to-r from-blue-600 to-indigo-600 p-4 text-white">
         <h1 class="text-3xl font-bold flex items-center gap-3">
-          <!-- ESP32 Chip Icon -->
           <svg class="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <rect x="3" y="6" width="18" height="12" rx="2" class="esp-icon"/>
             <path d="M7 9h2M7 12h2M7 15h2M15 9h2M15 12h2M15 15h2" class="esp-icon"/>
@@ -31,31 +56,27 @@
           </svg>
           ESP32 WiFi Setup
         </h1>
-        <p class="mt-2 opacity-90 flex items-center gap-2" id="platform-text">Universal BLE Configuration</p>
+        <p class="mt-1 opacity-90 flex items-center gap-2 text-sm" id="platform-text">Universal BLE Configuration</p>
       </div>
 
-      <!-- ==================== CONNECTION STATUS SECTION ==================== -->
-      <div class="p-6 border-b bg-gray-50">
-        <!-- Bluetooth Connection Controls -->
-        <div class="flex items-center justify-between mb-4">
+      <div class="p-4 border-b bg-gray-50">
+        <div class="flex items-center justify-between mb-3">
           <div class="flex items-center gap-3">
             <div id="bt-indicator" class="w-4 h-4 rounded-full bg-red-500"></div>
-            <span class="font-semibold" id="bt-status-text">Bluetooth: Disconnected</span>
+            <span class="font-semibold text-sm" id="bt-status-text">Bluetooth: Disconnected</span>
           </div>
           <div class="flex gap-2">
-            <button id="btn-connect" class="px-5 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-md">
+            <button id="btn-connect" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-md text-sm">
               Connect BLE
             </button>
-            <button id="btn-disconnect" class="px-5 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition font-medium hidden">
+            <button id="btn-disconnect" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition font-medium hidden text-sm">
               Disconnect
             </button>
           </div>
         </div>
 
-        <!-- Connected Device Information Card -->
-        <div id="device-info-card" class="p-4 bg-blue-50 rounded-lg border-2 border-blue-100 mb-4 hidden">
+        <div id="device-info-card" class="p-3 bg-blue-50 rounded-lg border-2 border-blue-100 mb-3 hidden text-sm">
           <div class="flex items-center gap-2">
-            <!-- Chip Icon -->
             <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <rect x="5" y="5" width="14" height="14" rx="1" class="esp-icon"/>
               <path d="M5 9h14M5 15h14M9 5v14M15 5v14" class="esp-icon"/>
@@ -65,73 +86,62 @@
           </div>
         </div>
 
-        <!-- WiFi Status Information Card -->
-        <div id="wifi-status-card" class="p-4 bg-white rounded-lg border-2 border-blue-100 hidden">
+        <div id="wifi-status-card" class="p-3 bg-white rounded-lg border-2 border-blue-100 hidden text-sm">
           <div class="flex items-center gap-2 mb-2">
-            <!-- WiFi Icon -->
             <svg class="w-5 h-5 text-gray-400" id="wifi-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path d="M12 20h.01M8.5 16.5a5 5 0 017 0M5 13a10 10 0 0114 0M1.42 9.42a14 14 0 0121.16 0" class="esp-icon"/>
             </svg>
             <span class="font-semibold">WiFi Status:</span>
             <span class="font-medium text-gray-600" id="wifi-status">Unknown</span>
           </div>
-          <!-- IP Address Display -->
-          <div id="ip-display" class="text-sm text-gray-700 ml-7 hidden">
+          <div id="ip-display" class="text-xs text-gray-700 ml-7 hidden">
             <span class="font-medium">IP:</span>
-            <a href="#" target="_blank" id="ip-address" class="font-mono bg-gray-100 px-2 py-1 rounded text-blue-600 hover:underline" title="Open device in browser"></a>
+            <a href="#" target="_blank" id="ip-address" class="font-mono bg-gray-100 px-2 py-0.5 rounded text-blue-600 hover:underline" title="Open device in browser"></a>
           </div>
-          <!-- Signal Strength Display -->
-          <div id="rssi-display" class="text-sm text-gray-700 ml-7 mt-1 hidden">
-            <span class="font-medium">Signal:</span> <span class="font-mono bg-gray-100 px-2 py-1 rounded" id="rssi-value"></span>
+          <div id="rssi-display" class="text-xs text-gray-700 ml-7 mt-1 hidden">
+            <span class="font-medium">Signal:</span> <span class="font-mono bg-gray-100 px-2 py-0.5 rounded" id="rssi-value"></span>
           </div>
-          <!-- IP Mode Display -->
-          <div id="ip-mode-display" class="text-sm text-gray-700 ml-7 mt-1 hidden">
-            <span class="font-medium">IP Mode:</span> <span class="font-mono bg-gray-100 px-2 py-1 rounded" id="ip-mode"></span>
+          <div id="ip-mode-display" class="text-xs text-gray-700 ml-7 mt-1 hidden">
+            <span class="font-medium">IP Mode:</span> <span class="font-mono bg-gray-100 px-2 py-0.5 rounded" id="ip-mode"></span>
           </div>
         </div>
       </div>
 
-      <!-- ==================== WIFI CONFIGURATION SECTION ==================== -->
-      <div class="p-6 border-b">
-        <h2 class="text-xl font-bold mb-4 flex items-center gap-2">
-          <!-- Network Icon -->
+      <div class="p-4 border-b">
+        <h2 class="text-xl font-bold mb-3 flex items-center gap-2">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path d="M12 20h.01M8.5 16.5a5 5 0 017 0M5 13a10 10 0 0114 0M1.42 9.42a14 14 0 0121.16 0" class="esp-icon"/>
           </svg>
           WiFi Configuration
         </h2>
 
-        <div class="space-y-4">
-          <!-- SSID Input -->
+        <div class="space-y-3">
           <div>
-            <label class="block text-sm font-medium text-gray-700 mb-2">Network Name (SSID) *</label>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Network Name (SSID) *</label>
             <input
               type="text"
               id="input-ssid"
               placeholder="Enter WiFi network name"
-              class="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+              class="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
               disabled
               autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false" inputmode="text"
             />
           </div>
 
-          <!-- Password Input -->
           <div>
-            <label class="block text-sm font-medium text-gray-700 mb-2">Password</label>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
             <input
               type="password"
               id="input-password"
               placeholder="(leave blank to keep saved password)"
-              class="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+              class="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
               disabled
               autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false"
             />
           </div>
 
-          <!-- ==================== IP CONFIGURATION SECTION ==================== -->
-          <div class="border-t pt-4">
-            <h3 class="text-lg font-bold mb-3 flex items-center gap-2">
-              <!-- Settings Icon -->
+          <div class="border-t pt-3">
+            <h3 class="font-bold mb-2 flex items-center gap-2">
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <circle cx="12" cy="12" r="3" class="esp-icon"/>
                 <path d="M12 1v6m0 6v6M23 12h-6m-6 0H5" class="esp-icon"/>
@@ -140,17 +150,15 @@
               IP Address Configuration
             </h3>
 
-            <!-- DHCP Checkbox -->
-            <div class="mb-4">
+            <div class="mb-3">
               <label class="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" id="use-dhcp" class="w-5 h-5 text-blue-600 rounded focus:ring-blue-500" checked disabled>
-                <span class="font-medium">Use DHCP (Automatic IP)</span>
+                <span class="font-medium text-sm">Use DHCP (Automatic IP)</span>
               </label>
             </div>
 
-            <!-- Static IP Configuration Fields -->
-            <div id="static-ip-config" class="space-y-3 hidden">
-              <div class="grid grid-cols-2 gap-3">
+            <div id="static-ip-config" class="space-y-2 hidden">
+              <div class="grid grid-cols-2 gap-2">
                 <div>
                   <label class="block text-sm font-medium text-gray-700 mb-1">Static IP *</label>
                   <input type="text" id="static-ip" placeholder="192.168.1.100" class="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
@@ -160,28 +168,25 @@
                   <input type="text" id="gateway" placeholder="192.168.1.1" class="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
                 </div>
               </div>
-              <div class="grid grid-cols-2 gap-3">
+              <div class="grid grid-cols-2 gap-2">
                 <div>
-                  <label class="block text-sm font-medium text-gray-700 mb-1">Subnet Mask (optional)</label>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">Subnet (optional)</label>
                   <input type="text" id="subnet" placeholder="255.255.255.0" class="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
                 </div>
                 <div>
-                  <label class="block text-sm font-medium text-gray-700 mb-1">DNS Server (optional)</label>
+                  <label class="block text-sm font-medium text-gray-700 mb-1">DNS (optional)</label>
                   <input type="text" id="dns" placeholder="8.8.8.8" class="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" disabled>
                 </div>
               </div>
             </div>
           </div>
 
-          <!-- ==================== ACTION BUTTONS ==================== -->
-          <!-- Primary Action Buttons -->
           <div class="grid grid-cols-2 gap-3">
             <button
               id="btn-configure"
               disabled
-              class="px-4 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium shadow-md"
+              class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium shadow-md text-sm"
             >
-              <!-- Check Icon -->
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path d="M5 13l4 4L19 7" class="esp-icon"/>
               </svg>
@@ -191,9 +196,8 @@
             <button
               id="btn-status"
               disabled
-              class="px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium shadow-md"
+              class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2 font-medium shadow-md text-sm"
             >
-              <!-- Refresh Icon -->
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path d="M4 4v5h5M20 20v-5h-5" class="esp-icon"/>
                 <path d="M4 9a9 9 0 019-5 9 9 0 019 9M20 15a9 9 0 01-9 5 9 9 0 01-9-9" class="esp-icon"/>
@@ -202,12 +206,11 @@
             </button>
           </div>
 
-          <!-- Secondary Action Buttons -->
           <div class="grid grid-cols-2 gap-3">
             <button
               id="btn-disconnect-wifi"
               disabled
-              class="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              class="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2 text-sm"
             >
               Disconnect WiFi
             </button>
@@ -215,7 +218,7 @@
             <button
               id="btn-clear"
               disabled
-              class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center gap-2 text-sm"
             >
               Clear Saved
             </button>
@@ -223,13 +226,12 @@
         </div>
       </div>
 
-      <!-- ==================== ACTIVITY LOG SECTION ==================== -->
-      <div class="p-6">
-        <div class="flex items-center justify-between mb-3">
+      <div class="p-4">
+        <div class="flex items-center justify-between mb-2">
           <h2 class="text-xl font-bold">Activity Log</h2>
           <button id="btn-clear-log" class="text-sm text-gray-500 hover:text-gray-700 transition">Clear</button>
         </div>
-        <div id="log-container" class="bg-gray-900 text-gray-100 rounded-lg p-4 h-64 overflow-y-auto font-mono text-sm">
+        <div id="log-container" class="bg-gray-900 text-gray-100 rounded-lg p-3 h-48 overflow-y-auto font-mono text-xs">
           <div class="text-gray-500 text-center py-8">
             No activity yet. Connect to a BLE device to start.
           </div>
@@ -237,17 +239,15 @@
       </div>
     </div>
 
-    <!-- ==================== INSTRUCTIONS SECTION ==================== -->
-    <div class="mt-6 bg-white rounded-lg shadow-lg p-6">
-      <h3 class="font-bold text-lg mb-3 flex items-center gap-2">
-        <!-- Info Icon -->
+    <div class="mt-4 bg-white rounded-lg shadow-lg p-4">
+      <h3 class="font-bold text-lg mb-2 flex items-center gap-2">
         <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <circle cx="12" cy="12" r="10" class="esp-icon"/>
           <path d="M12 16v-4M12 8h.01" class="esp-icon"/>
         </svg>
         Setup Instructions
       </h3>
-      <div class="space-y-3 text-sm text-gray-700">
+      <div class="space-y-2 text-sm text-gray-700">
         <div class="flex gap-3">
           <span class="font-bold text-blue-600 min-w-[20px]">1.</span>
           <span><strong>Android:</strong> Use Chrome | <strong>iOS:</strong> Use Safari 16.4+ or Bluefy</span>
@@ -269,8 +269,8 @@
           <span>Click "Configure" - Device will connect and display its IP</span>
         </div>
       </div>
-      <div class="mt-4 p-3 bg-blue-50 rounded-lg border border-blue-200 text-xs text-blue-800">
-        <strong>Compatibility:</strong> Works with any BLE device that exposes at least one writable and one notifiable characteristic. 
+      <div class="mt-3 p-3 bg-blue-50 rounded-lg border border-blue-200 text-xs text-blue-800">
+        <strong>Compatibility:</strong> Works with any BLE device that exposes at least one writable and one notifiable characteristic.
         The app will automatically discover and use the appropriate GATT characteristics.
       </div>
     </div>
@@ -278,17 +278,17 @@
 
   <script>
     /* ========================================
-       GLOBAL VARIABLES & STATE MANAGEMENT
+        GLOBAL VARIABLES & STATE MANAGEMENT
     ======================================== */
     var device = null;
     var gattServer = null;
     var rxCharacteristic = null;
     var txCharacteristic = null;
     var isConnected = false;
+    var deferredInstallPrompt = null;
 
     /* ========================================
-       COMMAND QUEUE SYSTEM
-       Prevents "GATT operation already in progress" errors
+        COMMAND QUEUE SYSTEM
     ======================================== */
     var cmdQueue = [];
     var queueBusy = false;
@@ -331,7 +331,40 @@
     var delay = function (ms) { return new Promise(function(r){ setTimeout(r, ms); }); };
 
     /* ========================================
-       PLATFORM DETECTION
+        GENERATE PNG ICON FROM CANVAS
+    ======================================== */
+    function generateIcon(size) {
+      var canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      var ctx = canvas.getContext('2d');
+      
+      ctx.fillStyle = '#2563EB';
+      var radius = size * 0.2;
+      ctx.beginPath();
+      ctx.moveTo(radius, 0);
+      ctx.lineTo(size - radius, 0);
+      ctx.quadraticCurveTo(size, 0, size, radius);
+      ctx.lineTo(size, size - radius);
+      ctx.quadraticCurveTo(size, size, size - radius, size);
+      ctx.lineTo(radius, size);
+      ctx.quadraticCurveTo(0, size, 0, size - radius);
+      ctx.lineTo(0, radius);
+      ctx.quadraticCurveTo(0, 0, radius, 0);
+      ctx.closePath();
+      ctx.fill();
+      
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold ' + (size * 0.45) + 'px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('ESP', size / 2, size / 2 + (size * 0.03));
+      
+      return canvas.toDataURL('image/png');
+    }
+
+    /* ========================================
+        PLATFORM DETECTION
     ======================================== */
     (function detectPlatform() {
       var ua = navigator.userAgent.toLowerCase();
@@ -342,7 +375,7 @@
     })();
 
     /* ========================================
-       UI ELEMENT REFERENCES
+        UI ELEMENT REFERENCES
     ======================================== */
     var btnConnect = document.getElementById('btn-connect');
     var btnDisconnect = document.getElementById('btn-disconnect');
@@ -368,7 +401,7 @@
     inputSsid.setAttribute('spellcheck', 'false');
 
     /* ========================================
-       EVENT LISTENERS SETUP
+        EVENT LISTENERS SETUP
     ======================================== */
     btnConnect.addEventListener('click', connectBluetooth);
     btnDisconnect.addEventListener('click', disconnectBluetooth);
@@ -389,8 +422,7 @@
     });
 
     /* ========================================
-       BLUETOOTH CONNECTION HANDLER
-       Accepts ALL BLE devices (no name filtering)
+        BLUETOOTH CONNECTION HANDLER
     ======================================== */
     async function connectBluetooth() {
       if (!navigator.bluetooth) {
@@ -446,8 +478,7 @@
     }
 
     /* ========================================
-       GATT CHARACTERISTICS DISCOVERY
-       Dynamically finds suitable RX/TX characteristics
+        GATT CHARACTERISTICS DISCOVERY
     ======================================== */
     async function discoverGattCharacteristics() {
       rxCharacteristic = null;
@@ -482,7 +513,7 @@
             var ch2 = chars[k];
             var p2 = ch2.properties || {};
             if (p2.writeWithoutResponse || p2.write) candidatePairs.push({ rx: ch2, tx: null, score: 1 });
-            if (p2.notify || p2.indicate)          candidatePairs.push({ rx: null, tx: ch2, score: 1 });
+            if (p2.notify || p2.indicate)           candidatePairs.push({ rx: null, tx: ch2, score: 1 });
           }
         }
       }
@@ -514,7 +545,7 @@
     }
 
     /* ========================================
-       BLUETOOTH DISCONNECT HANDLER
+        BLUETOOTH DISCONNECT HANDLER
     ======================================== */
     function disconnectBluetooth() {
       try { 
@@ -528,8 +559,7 @@
     }
 
     /* ========================================
-       BLE NOTIFICATION HANDLER
-       Processes incoming messages from ESP32
+        BLE NOTIFICATION HANDLER
     ======================================== */
     function handleNotification(event) {
       var dv = event.target && event.target.value ? event.target.value : null;
@@ -575,7 +605,7 @@
     }
 
     /* ========================================
-       WIFI CONFIGURATION FUNCTION
+        WIFI CONFIGURATION FUNCTION
     ======================================== */
     function configureWifi() {
       var ssid = inputSsid.value.trim();
@@ -618,7 +648,7 @@
     }
 
     /* ========================================
-       CLEAR WIFI CREDENTIALS FUNCTION
+        CLEAR WIFI CREDENTIALS FUNCTION
     ======================================== */
     function clearWifi() {
       if (confirm('Clear saved WiFi credentials on device?')) {
@@ -634,7 +664,7 @@
     }
 
     /* ========================================
-       VALIDATION FUNCTIONS
+        VALIDATION FUNCTIONS
     ======================================== */
     function isIPv4(s) {
       var parts = s.split('.');
@@ -649,7 +679,7 @@
     }
 
     /* ========================================
-       UI UPDATE FUNCTIONS
+        UI UPDATE FUNCTIONS
     ======================================== */
     function updateUI() {
       var indicator = document.getElementById('bt-indicator');
@@ -745,7 +775,7 @@
     }
 
     /* ========================================
-       ACTIVITY LOG FUNCTION
+        ACTIVITY LOG FUNCTION
     ======================================== */
     function addLog(message, type) {
       if (type === void 0) type = 'info';
@@ -773,28 +803,43 @@
     }
 
     /* ========================================
-       PWA (PROGRESSIVE WEB APP) SETUP
+        PWA SETUP WITH PROPER MANIFEST & ICONS
     ======================================== */
     (function setupPWA(){
+      var icon192 = generateIcon(192);
+      var icon512 = generateIcon(512);
+      
+      document.getElementById('icon-192').href = icon192;
+      document.getElementById('icon-512').href = icon512;
+      document.getElementById('apple-icon').href = icon192;
+      
       var manifest = {
-        name: "ESP32 WiFi Configurator",
+        name: "ESP32 WiFi Setup",
         short_name: "ESP32 WiFi",
-        start_url: "./index.html",
+        description: "Configure ESP32 WiFi via Bluetooth",
+        start_url: "./",
+        scope: "./",
         display: "standalone",
-        background_color: "#F9FAFB",
+        display_override: ["window-controls-overlay", "standalone", "minimal-ui"],
+        orientation: "portrait-primary",
+        background_color: "#FFFFFF",
         theme_color: "#2563EB",
         icons: [
-          { 
-            src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%232563EB' width='192' height='192' rx='40'/%3E%3Ctext x='96' y='130' font-family='Arial' font-size='90' font-weight='bold' fill='white' text-anchor='middle'%3EESP%3C/text%3E%3C/svg%3E", 
-            sizes: "192x192", 
-            type: "image/svg+xml" 
+          {
+            src: icon192,
+            sizes: "192x192",
+            type: "image/png",
+            purpose: "any maskable"
           },
-          { 
-            src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect fill='%232563EB' width='512' height='512' rx='100'/%3E%3Ctext x='256' y='350' font-family='Arial' font-size='240' font-weight='bold' fill='white' text-anchor='middle'%3EESP%3C/text%3E%3C/svg%3E", 
-            sizes: "512x512", 
-            type: "image/svg+xml" 
+          {
+            src: icon512,
+            sizes: "512x512",
+            type: "image/png",
+            purpose: "any maskable"
           }
-        ]
+        ],
+        categories: ["utilities", "productivity"],
+        shortcuts: []
       };
       
       var manifestLink = document.getElementById('inline-manifest');
@@ -802,28 +847,94 @@
       manifestLink.href = URL.createObjectURL(manifestBlob);
 
       if ('serviceWorker' in navigator) {
-        var swLines = [
-          "const CACHE_NAME = 'esp32-wifi-pwa-v1';",
-          "const FILES_TO_CACHE = ['.', './index.html'];",
-          "self.addEventListener('install', function(e){",
-          "  e.waitUntil(caches.open(CACHE_NAME).then(function(c){ return c.addAll(FILES_TO_CACHE); }));",
-          "});",
-          "self.addEventListener('activate', function(e){",
-          "  e.waitUntil(caches.keys().then(function(keys){",
-          "    return Promise.all(keys.map(function(k){ if (k !== CACHE_NAME) { return caches.delete(k); } }));",
-          "  }));",
-          "});",
-          "self.addEventListener('fetch', function(e){",
-          "  e.respondWith(caches.match(e.request).then(function(r){ return r || fetch(e.request); }));",
-          "});"
-        ];
-        var swCode = swLines.join('\n');
-        var swBlob = new Blob([swCode], { type: 'text/javascript' });
-        var swUrl = URL.createObjectURL(swBlob);
-        window.addEventListener('load', function () {
-          navigator.serviceWorker.register(swUrl).catch(function(err){ console.warn(err); });
+        window.addEventListener('load', function() {
+          var swCode = `
+const CACHE_NAME = 'esp32-wifi-v2';
+const URLS_TO_CACHE = ['./', './index.html'];
+
+self.addEventListener('install', function(e) {
+  e.waitUntil(
+    caches.open(CACHE_NAME).then(function(cache) {
+      return cache.addAll(URLS_TO_CACHE);
+    })
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', function(e) {
+  e.waitUntil(
+    caches.keys().then(function(keys) {
+      return Promise.all(
+        keys.map(function(key) {
+          if (key !== CACHE_NAME) {
+            return caches.delete(key);
+          }
+        })
+      );
+    })
+  );
+  return self.clients.claim();
+});
+
+self.addEventListener('fetch', function(e) {
+  e.respondWith(
+    caches.match(e.request).then(function(response) {
+      return response || fetch(e.request);
+    })
+  );
+});
+          `;
+          
+          var swBlob = new Blob([swCode], { type: 'text/javascript' });
+          var swUrl = URL.createObjectURL(swBlob);
+          navigator.serviceWorker.register(swUrl).then(function(reg) {
+            addLog('Service Worker registered', 'success');
+          }).catch(function(err) {
+            console.warn('SW registration failed:', err);
+          });
         });
       }
+
+      var pwaInstallBar = document.getElementById('pwa-install-bar');
+      var pwaInstallBtn = document.getElementById('btn-pwa-install');
+      var pwaDismissBtn = document.getElementById('btn-pwa-dismiss');
+
+      window.addEventListener('beforeinstallprompt', function(e) {
+        e.preventDefault();
+        deferredInstallPrompt = e;
+        if (pwaInstallBar) pwaInstallBar.classList.remove('hidden');
+        addLog('PWA install available', 'info');
+      });
+
+      if (pwaInstallBtn) {
+        pwaInstallBtn.addEventListener('click', async function() {
+          if (!deferredInstallPrompt) return;
+          
+          deferredInstallPrompt.prompt();
+          var choiceResult = await deferredInstallPrompt.userChoice;
+          
+          if (choiceResult.outcome === 'accepted') {
+            addLog('PWA installation accepted', 'success');
+          } else {
+            addLog('PWA installation dismissed', 'info');
+          }
+          
+          if (pwaInstallBar) pwaInstallBar.classList.add('hidden');
+          deferredInstallPrompt = null;
+        });
+      }
+
+      if (pwaDismissBtn) {
+        pwaDismissBtn.addEventListener('click', function() {
+          if (pwaInstallBar) pwaInstallBar.classList.add('hidden');
+          addLog('PWA install prompt dismissed', 'info');
+        });
+      }
+
+      window.addEventListener('appinstalled', function() {
+        addLog('PWA installed successfully!', 'success');
+        if (pwaInstallBar) pwaInstallBar.classList.add('hidden');
+      });
     })();
 
     updateUI();
