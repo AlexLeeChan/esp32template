@@ -1676,34 +1676,23 @@ void checkWiFiConnection() {
     case WIFI_STATE_CONNECTING:
       if (status == WL_CONNECTED) {
         wifiState = WIFI_STATE_CONNECTED;
-        wifiReconnectAttempts = 0;  // ✅ Reset on successful connection
-        wifiLastConnectAttempt = now;  // ✅ Update timestamp
+        wifiReconnectAttempts = 0;
       } else if (now - wifiLastConnectAttempt > WIFI_CONNECT_TIMEOUT) {
         wifiState = WIFI_STATE_DISCONNECTED;
-        wifiLastConnectAttempt = now;  // ✅ Update for backoff calculation
       }
       break;
 
     case WIFI_STATE_CONNECTED:
       if (status != WL_CONNECTED) {
         wifiState = WIFI_STATE_DISCONNECTED;
-        wifiLastConnectAttempt = now;  // ✅ Update when disconnecting
-      } else {
-        // ✅ NEW: Reset reconnect attempts after sustained connection (5 minutes)
-        if (wifiReconnectAttempts > 0 && (now - wifiLastConnectAttempt > 300000)) {
-          wifiReconnectAttempts = 0;
-        }
       }
       break;
 
     case WIFI_STATE_DISCONNECTED:
-      {
-        uint8_t maxShift = min(wifiReconnectAttempts, (uint8_t)4);
-        uint32_t backoffDelay = WIFI_RECONNECT_DELAY * (1 << maxShift);
-        if (now - wifiLastConnectAttempt > backoffDelay) {
-          wifiState = WIFI_STATE_IDLE;
-          // wifiLastConnectAttempt will be updated when entering CONNECTING state
-        }
+      uint8_t maxShift = min(wifiReconnectAttempts, (uint8_t)4);
+      uint32_t backoffDelay = WIFI_RECONNECT_DELAY * (1 << maxShift);
+      if (now - wifiLastConnectAttempt > backoffDelay) {
+        wifiState = WIFI_STATE_IDLE;
       }
       break;
   }
@@ -2450,93 +2439,11 @@ async function startOTAUpdate(){
    refreshOTA();
  }
  else{
-   // Transform the page to show OTA progress immediately
-   showOTAProgress();
+   // Redirect to OTA monitoring page after 1 second
+   setTimeout(() => {
+     location.reload(); // This will load the OTA_BUSY_HTML page
+   }, 1000);
  }
-}
-
-function showOTAProgress(){
-  // Hide everything except a progress card
-  document.body.innerHTML = `
-<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;
-background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;
-min-height:100vh;margin:0">
-<div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;max-width:420px;width:90%">
- <h3 style="color:#58a6ff;margin:0 0 8px 0" id="otaTitle">Updating firmware...</h3>
- <p style="margin:0 0 12px 0;color:#8b949e;font-size:0.9em" id="otaStatusText">Device is applying an update. Please wait...</p>
- <div style="height:10px;background:#21262d;border:1px solid #30363d;border-radius:6px;overflow:hidden">
-  <div style="height:100%;width:1%;background:linear-gradient(90deg,#238636,#3fb950);transition:width 0.4s ease;" id="otaFill"></div>
- </div>
- <p style="color:#8b949e;font-size:12px;margin-top:8px;text-align:center;min-height:1em" id="otaProgressText">Starting...</p>
-</div>
-</div>`;
-
-  // Start polling for progress
-  pollOTAProgress();
-}
-
-async function pollOTAProgress(){
-  try{
-    const r = await fetch('/api/ota/status');
-    const j = await r.json();
-    
-    const fill = document.getElementById('otaFill');
-    const prog = document.getElementById('otaProgressText');
-    const title = document.getElementById('otaTitle');
-    const status = document.getElementById('otaStatusText');
-    
-    if(!j) { 
-      setTimeout(pollOTAProgress, 1000); 
-      return; 
-    }
-
-    // If OTA finished or failed, reload to main page
-    if(j.state === 0 || j.state === 3 || j.state === 4){ 
-      setTimeout(() => location.reload(), 2000);
-      if(j.state === 3) {
-        title.textContent = 'Update Complete!';
-        status.textContent = 'Device will reboot shortly...';
-        fill.style.width = '100%';
-        prog.textContent = '100% - Rebooting...';
-      } else if(j.state === 4) {
-        title.textContent = 'Update Failed';
-        status.textContent = 'Error: ' + (j.error || 'Unknown error');
-        prog.textContent = 'Returning to dashboard...';
-      }
-      return; 
-    }
-
-    if(j.state === 1) {
-      title.textContent = 'Checking...';
-      status.textContent = 'Preparing firmware update...';
-      prog.textContent = 'Initializing...';
-      fill.style.width = '1%';
-    } else if (j.state === 2) {
-      title.textContent = 'Downloading...';
-      status.textContent = 'Downloading new firmware. Do not unplug.';
-      const p = j.progress || 0;
-      fill.style.width = p + '%';
-      
-      let pText = p + '%';
-      if (j.file_size > 0) {
-        const downloaded = fmB((j.file_size * p) / 100);
-        const total = fmB(j.file_size);
-        pText = `${p}% (${downloaded} / ${total})`;
-      }
-      
-      if (p >= 99) {
-        title.textContent = 'Flashing...';
-        status.textContent = 'Download complete. Writing to flash...';
-        prog.textContent = 'This may take a minute. Device will reboot.';
-      } else {
-        prog.textContent = pText;
-      }
-    }
-  }catch(e){
-    document.getElementById('otaProgressText').textContent = 'Connection lost. Retrying...';
-  }
-  
-  setTimeout(pollOTAProgress, 800);
 }
 
 async function resetOTA(){
