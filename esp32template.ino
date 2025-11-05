@@ -325,41 +325,109 @@ min-height:100vh;margin:0}
 .h{color:#58a6ff;margin:0 0 8px 0}
 .p{margin:0 0 12px 0;color:#8b949e;font-size:0.9em}
 .bar{height:10px;background:#21262d;border:1px solid #30363d;border-radius:6px;overflow:hidden}
-.fill{height:100%;width:100%;background:linear-gradient(90deg,#238636,#3fb950);}
+.fill{height:100%;width:0%;background:linear-gradient(90deg,#238636,#3fb950);transition:width 0.4s ease;}
 .small{color:#8b949e;font-size:12px;margin-top:8px;text-align:center;min-height:1em}
 </style></head><body>
 <div class="card">
- <h3 class="h" id="otaTitle">Flashing...</h3>
- <p class="p" id="otaStatusText">Download complete. Writing to flash...</p>
- <div class="bar"><div class="fill"></div></div>
- <p class="small" id="otaProgressText">This may take a minute. Device will reboot.</p>
+ <h3 class="h" id="otaTitle">Updating firmware...</h3>
+ <p class="p" id="otaStatusText">Device is applying an update. Please wait...</p>
+ <div class="bar"><div class="fill" id="otaFill"></div></div>
+ <p class="small" id="otaProgressText">Connecting...</p>
 </div>
 <script>
-// This is the new, simpler polling function.
-// It just tries to fetch the root page ('/') over and over.
-// As long as the ESP is offline (rebooting), the fetch will fail.
-// As soon as the fetch succeeds, we know the ESP is back online and we can reload.
-(function poll() {
+function fmB(b){if(!b||b<0)return'0B';if(b<1024)return`${b}B`;if(b<1048576)return`${(b/1024).toFixed(1)}KB`;return`${(b/1048576).toFixed(2)}MB`;}
+const fill=document.getElementById('otaFill');
+const prog=document.getElementById('otaProgressText');
+const title=document.getElementById('otaTitle');
+const status=document.getElementById('otaStatusText');
+let isFlashing = false;
+
+// --- NEW HYBRID POLL FUNCTION ---
+// 1. Polls for progress during download.
+// 2. Switches to reboot polling when flashing begins.
+
+// Simple poller for reboot
+function pollForReboot() {
   setTimeout(() => {
     fetch('/')
       .then(r => {
-        // As soon as the server responds (any 2xx response), we reload.
         if (r.ok) {
-          document.getElementById('otaProgressText').textContent = 'Reboot complete. Reloading...';
+          prog.textContent = 'Reboot complete. Reloading...';
           location.reload();
         } else {
-          // Server is up but sent an error? Try again.
-          document.getElementById('otaProgressText').textContent = 'Server error. Retrying...';
-          poll();
+          prog.textContent = 'Server error. Retrying...';
+          pollForReboot(); // Recurse
         }
       })
       .catch(e => {
-        // Fetch fails = server is offline (rebooting). This is expected.
-        document.getElementById('otaProgressText').textContent = 'Device rebooting... Reconnecting...';
-        poll(); // Try again
+        prog.textContent = 'Device rebooting... Reconnecting...';
+        pollForReboot(); // Recurse
       });
   }, 2000); // Check every 2 seconds
-})();
+}
+
+// Main poller for download progress
+async function pollProgress(){
+  if (isFlashing) return; // Switched to reboot polling
+
+  try{
+   const r = await fetch('/api/ota/status');
+   if (!r.ok) {
+     prog.textContent = 'Reconnecting...';
+     setTimeout(pollProgress, 1500);
+     return;
+   }
+
+   const j = await r.json();
+   if(!j) { setTimeout(pollProgress, 1500); return; }
+
+   // Exit states: Reload to main page
+   // On reboot, server will send state 0 (OTA_IDLE), triggering this.
+   if(j.state===0 || j.state===4 || j.state===5){ 
+     prog.textContent = 'Update complete. Reloading...';
+     location.reload(); 
+     return; 
+   }
+
+   // State 1 (Checking) or 2 (Downloading): Update progress bar
+   if(j.state===1 || j.state===2) {
+     title.textContent = (j.state===1) ? 'Checking...' : 'Downloading...';
+     status.textContent = (j.state===1) ? 'Checking for firmware update...' : 'Downloading new firmware. Do not unplug.';
+     const p = j.progress || 0;
+     fill.style.width = p + '%';
+     
+     let pText = p + '%';
+     if (j.file_size > 0) {
+       const downloaded = fmB((j.file_size * p) / 100);
+       const total = fmB(j.file_size);
+       pText = `${p}% (${downloaded} / ${total})`;
+     }
+     prog.textContent = pText;
+   
+   // State 3 (Flashing): Update UI and switch to reboot polling
+   } else if (j.state===3) {
+     isFlashing = true; // Stop this poll loop
+     title.textContent = 'Flashing...';
+     status.textContent = 'Download complete. Writing to flash...';
+     prog.textContent = 'This may take a minute. Device will reboot.';
+     fill.style.width = '100%';
+     
+     // Start the simple reboot poller
+     pollForReboot();
+     return; // Stop this function
+   }
+  }catch(e){
+   prog.textContent = 'Connection lost. Retrying...';
+  }
+  
+  // If not flashing, continue polling for progress
+  if (!isFlashing) {
+    setTimeout(pollProgress, 1000);
+  }
+ }
+ 
+ // Start the main progress poller
+ pollProgress();
 </script>
 </body></html>
 )HTML";
