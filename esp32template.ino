@@ -1,9 +1,10 @@
 /*
-  ESP32(x) Per-Core Monitor Template
-  Features: Per-core CPU tracking, BLE control, WiFi config, Task monitoring
+  ESP32(x) Control Template - OPTIMIZED OTA VERSION
+  Features: RTOS, BLE control, WiFi config, Task monitoring, Reliable OTA over WEB
 */
 
 #define DEBUG_MODE 1
+#define ENABLE_OTA 1
 
 // FreeRTOS runtime stats configuration
 #ifndef CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
@@ -35,6 +36,13 @@
 #include <esp_timer.h>
 #include <esp_log.h>
 #include <pgmspace.h>
+#if ENABLE_OTA
+#include <Update.h>
+#include <esp_ota_ops.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "esp_partition.h"
+#endif
 
 // Target chip detection
 #if defined(CONFIG_IDF_TARGET_ESP32)
@@ -105,7 +113,7 @@ extern "C" uint32_t ulGetRunTimeCounterValue(void) {
 // Board-specific LED pins
 #if defined(CONFIG_IDF_TARGET_ESP32C3)
 #define BLE_LED_PIN 8
-#define LED_INVERTED 1  
+#define LED_INVERTED 1
 #elif defined(CONFIG_IDF_TARGET_ESP32C6)
 #define BLE_LED_PIN 15
 #define LED_INVERTED 0
@@ -234,21 +242,858 @@ struct MemoryInfo {
   bool hasPsram;
 };
 
+#if ENABLE_OTA
+// OTA Update state
+enum OTAState : uint8_t {
+  OTA_IDLE = 0,
+  OTA_CHECKING,
+  OTA_DOWNLOADING,
+  OTA_SUCCESS,
+  OTA_FAILED
+};
+
+struct OTAStatus {
+  volatile OTAState state;
+  volatile uint8_t progress;
+  String error;
+  bool available;
+  volatile uint32_t fileSize;
+};
+
+OTAStatus otaStatus = { OTA_IDLE, 0, "", true, 0 };
+
+SemaphoreHandle_t otaMutex = nullptr;
+SemaphoreHandle_t taskDeletionMutex = nullptr;
+volatile bool tasksDeleted = false;
+
+// Task exit signals for graceful shutdown
+volatile bool webTaskShouldExit = false;
+volatile bool bizTaskShouldExit = false;
+
+// OTA in progress flag to prevent WiFi management interference
+volatile bool otaInProgress = false;
+#endif
+
 // Forward declarations
-void handleBLECommand(String cmd);
-void setupWiFi();
-void checkWiFiConnection();
-void updateTaskMonitoring();
-void sendTaskMonitoring();
-void routes();
-void systemTask(void* param);
-void webTask(void* param);
-void bizTask(void* param);
+static void handleBLECommand(String cmd);
+static void setupWiFi();
+static void checkWiFiConnection();
+static void updateTaskMonitoring();
+static void sendTaskMonitoring();
+static void routes();
+static void systemTask(void* param);
+static void webTask(void* param);
+static void bizTask(void* param);
 static void handleApiStatus();
 static MemoryInfo getMemoryInfo();
+static void sendIndex();
+
+// ========== OTA Helper Functions ==========
+
+#if ENABLE_OTA
+static inline bool isOtaActive() {
+  bool active = false;
+  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    active = (otaStatus.state == OTA_CHECKING || otaStatus.state == OTA_DOWNLOADING);
+    xSemaphoreGive(otaMutex);
+  }
+  return active;
+}
+#else
+static inline bool isOtaActive() {
+  return false;
+}
+#endif
+
+// A tiny JSON reply to keep UI polling without stressing flash mappings
+static inline void sendBusyJson(WebServer& s, const char* msg = "OTA in progress") {
+  s.send(503, "application/json", String("{\"err\":\"") + msg + "\"}");
+}
+
+// A tiny HTML page for "/" during OTA (prevents big PROGMEM streaming)
+static const char OTA_BUSY_HTML[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OTA Updating...</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;
+background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;
+min-height:100vh;margin:0}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;max-width:420px;width:90%}
+.h{color:#58a6ff;margin:0 0 8px 0}
+.p{margin:0 0 12px 0;color:#8b949e;font-size:0.9em}
+.bar{height:10px;background:#21262d;border:1px solid #30363d;border-radius:6px;overflow:hidden}
+.fill{height:100%;width:0%;background:linear-gradient(90deg,#238636,#3fb950);transition:width 0.4s ease;}
+.small{color:#8b949e;font-size:12px;margin-top:8px;text-align:center;min-height:1em}
+</style></head><body>
+<div class="card">
+ <h3 class="h" id="otaTitle">Updating firmware...</h3>
+ <p class="p" id="otaStatusText">Device is applying an update. Please wait...</p>
+ <div class="bar"><div class="fill" id="otaFill"></div></div>
+ <p class="small" id="otaProgressText">Connecting...</p>
+</div>
+<script>
+function fmB(b){if(!b||b<0)return'0B';if(b<1024)return`${b}B`;if(b<1048576)return`${(b/1024).toFixed(1)}KB`;return`${(b/1048576).toFixed(2)}MB`;}
+const fill=document.getElementById('otaFill');
+const prog=document.getElementById('otaProgressText');
+const title=document.getElementById('otaTitle');
+const status=document.getElementById('otaStatusText');
+
+async function poll(){
+  try{
+   const r = await fetch('/api/ota/status');
+   const j = await r.json();
+   if(!j) { setTimeout(poll, 1500); return; }
+
+   if(j.state===0 || j.state===3 || j.state===4){ location.reload(); return; }
+
+   if(j.state===1) {
+    title.textContent = 'Checking...';
+    status.textContent = 'Checking for firmware update...';
+    prog.textContent = '...';
+    fill.style.width = '1%';
+   } else if (j.state===2) {
+    title.textContent = 'Downloading...';
+    status.textContent = 'Downloading new firmware. Do not unplug.';
+    const p = j.progress || 0;
+    fill.style.width = p + '%';
+    
+    let pText = p + '%';
+    if (j.file_size > 0) {
+     const downloaded = fmB((j.file_size * p) / 100);
+     const total = fmB(j.file_size);
+     pText = `${p}% (${downloaded} / ${total})`;
+    }
+    
+    if (p >= 99) {
+     title.textContent = 'Flashing...';
+     status.textContent = 'Download complete. Writing to flash...';
+     prog.textContent = 'This may take a minute. Device will reboot.';
+    } else {
+     prog.textContent = pText;
+    }
+   }
+  }catch(e){
+   prog.textContent = 'Connection lost. Retrying...';
+  }
+  setTimeout(poll, 1000);
+ }
+ poll();
+</script>
+</body></html>
+)HTML";
+
+// ========== Guarded Handlers ==========
+
+void sendIndex_guarded() {
+  if (isOtaActive()) {
+    server.sendHeader(F("Cache-Control"), F("no-store, no-cache, must-revalidate, max-age=0"));
+    server.sendHeader(F("Pragma"), F("no-cache"));
+    server.setContentLength(sizeof(OTA_BUSY_HTML) - 1);
+    server.send_P(200, PSTR("text/html"), OTA_BUSY_HTML);
+    return;
+  }
+  sendIndex();
+}
+
+void sendTaskMonitoring_guarded() {
+  if (isOtaActive()) {
+    sendBusyJson(server);
+    return;
+  }
+  sendTaskMonitoring();
+}
+
+void handleApiStatus_guarded() {
+  if (isOtaActive()) {
+    DynamicJsonDocument doc(256);
+    doc["connected"] = (WiFi.status() == WL_CONNECTED);
+    doc["ble"] = false;
+    doc["uptime_ms"] = millis();
+    doc["ota_active"] = true;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+    return;
+  }
+  handleApiStatus();
+}
 
 // ============================================================================
-// Message Pool (zero-malloc message handling)
+// OTA handling - OPTIMIZED VERSION WITH GRACEFUL TASK SHUTDOWN
+// ============================================================================
+#if ENABLE_OTA
+static void dumpPartitionInfo(String& logOutput) {
+  logOutput = "--- Partition Table ---\n";
+  const esp_partition_t* running = esp_ota_get_running_partition();
+
+  esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+  if (!it) {
+    logOutput += "Failed to find partitions!\n";
+    return;
+  }
+
+  char buf[256];
+  while (it != NULL) {
+    const esp_partition_t* p = esp_partition_get(it);
+    if (!p) {
+      it = esp_partition_next(it);
+      continue;
+    }
+
+    snprintf(buf, sizeof(buf), "Label: %-16s | Type: 0x%02x | Sub: 0x%02x | Addr: 0x%08x | Size: %u (%.2fMB) %s\n",
+             p->label, p->type, p->subtype,
+             p->address, p->size, (float)p->size / 1024.0 / 1024.0,
+             (p == running) ? "<- RUNNING" : "");
+    logOutput += buf;
+
+    it = esp_partition_next(it);
+  }
+  esp_partition_iterator_release(it);
+
+  const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
+  if (next) {
+    snprintf(buf, sizeof(buf), "Next OTA Partition: %s\n", next->label);
+    logOutput += buf;
+  } else {
+    logOutput += "Next OTA Partition: NOT FOUND!\n";
+  }
+}
+
+static void handleOTAStatus() {
+  DynamicJsonDocument doc(512);
+
+  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    doc["available"] = otaStatus.available;
+    doc["state"] = (uint8_t)otaStatus.state;
+    doc["progress"] = otaStatus.progress;
+    doc["error"] = otaStatus.error;
+    doc["file_size"] = otaStatus.fileSize;
+
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (running) {
+      doc["current_partition"] = running->label;
+    }
+
+    const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
+    if (next) {
+      doc["next_partition"] = next->label;
+      doc["partition_size"] = next->size;
+    }
+
+    xSemaphoreGive(otaMutex);
+  }
+
+  doc["sketch_size"] = ESP.getSketchSize();
+  doc["free_sketch_space"] = ESP.getFreeSketchSpace();
+  doc["sketch_md5"] = ESP.getSketchMD5();
+
+  String output;
+  output.reserve(512);
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+static void handleOTAInfo() {
+  String partitionInfo;
+  dumpPartitionInfo(partitionInfo);
+  server.send(200, F("text/plain"), partitionInfo);
+}
+
+// Signal tasks to exit gracefully and wait for them
+static void deleteNonEssentialTasks() {
+  if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (tasksDeleted) {
+      xSemaphoreGive(taskDeletionMutex);
+      return;
+    }
+    
+    Serial.println(F("\n=== Stopping Non-Essential Tasks for OTA ==="));
+    
+    // Stop business logic first
+    gBizState = BIZ_STOPPED;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Signal tasks to exit gracefully
+    webTaskShouldExit = true;
+    bizTaskShouldExit = true;
+    
+    Serial.println(F("Signaling tasks to exit gracefully..."));
+    
+    // Wait for tasks to clean up themselves (max 2 seconds)
+    uint8_t waitCount = 0;
+    while ((webTaskHandle != NULL || bizTaskHandle != NULL) && waitCount < 40) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      waitCount++;
+    }
+    
+    // Check if tasks exited gracefully
+    if (webTaskHandle != NULL) {
+      Serial.println(F("Warning: webTask didn't exit gracefully, force deleting..."));
+      vTaskDelete(webTaskHandle);
+      webTaskHandle = NULL;
+    } else {
+      Serial.println(F("✓ webTask exited gracefully"));
+    }
+    
+    if (bizTaskHandle != NULL) {
+      Serial.println(F("Warning: bizTask didn't exit gracefully, force deleting..."));
+      vTaskDelete(bizTaskHandle);
+      bizTaskHandle = NULL;
+    } else {
+      Serial.println(F("✓ bizTask exited gracefully"));
+    }
+    
+    tasksDeleted = true;
+    xSemaphoreGive(taskDeletionMutex);
+    
+    // Give idle task time to clean up
+    Serial.println(F("Waiting for cleanup..."));
+    vTaskDelay(pdMS_TO_TICKS(300));
+    
+    Serial.printf("Post-deletion Free Heap: %u bytes\n", ESP.getFreeHeap());
+    Serial.println(F("=== Task Deletion Complete ===\n"));
+  }
+}
+
+// Recreate tasks after OTA failure
+static void recreateTasks() {
+  if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (!tasksDeleted) {
+      xSemaphoreGive(taskDeletionMutex);
+      return;
+    }
+    
+    Serial.println(F("\n=== Recreating Tasks After OTA Failure ==="));
+    
+    // Reset exit flags
+    webTaskShouldExit = false;
+    bizTaskShouldExit = false;
+    
+    // Recreate biz task
+    if (bizTaskHandle == NULL) {
+      Serial.println(F("Creating bizTask..."));
+#if NUM_CORES > 1
+      BaseType_t result = xTaskCreatePinnedToCore(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle, 1);
+#else
+      BaseType_t result = xTaskCreate(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle);
+#endif
+      if (result == pdPASS) {
+        Serial.println(F("✓ bizTask created"));
+      } else {
+        Serial.println(F("✗ FAILED to create bizTask!"));
+      }
+    }
+    
+    // Recreate web task
+    if (webTaskHandle == NULL) {
+      Serial.println(F("Creating webTask..."));
+#if NUM_CORES > 1
+      BaseType_t result = xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, &webTaskHandle, 0);
+#else
+      BaseType_t result = xTaskCreate(webTask, "web", 8192, nullptr, 1, &webTaskHandle);
+#endif
+      if (result == pdPASS) {
+        Serial.println(F("✓ webTask created"));
+      } else {
+        Serial.println(F("✗ FAILED to create webTask!"));
+      }
+    }
+    
+    tasksDeleted = false;
+    xSemaphoreGive(taskDeletionMutex);
+    
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.println(F("=== Task Recreation Complete ===\n"));
+  }
+}
+
+static void handleOTAUpdate() {
+  if (!server.hasArg("plain")) {
+    server.send(400, F("application/json"), F("{\"err\":\"no body\"}"));
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+  if (error) {
+    server.send(400, F("application/json"), F("{\"err\":\"bad json\"}"));
+    return;
+  }
+
+  const char* url = doc["url"] | "";
+  if (strlen(url) == 0) {
+    server.send(400, F("application/json"), F("{\"err\":\"url required\"}"));
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(503, F("application/json"), F("{\"err\":\"WiFi not connected\"}"));
+    return;
+  }
+
+  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (otaStatus.state != OTA_IDLE) {
+      xSemaphoreGive(otaMutex);
+      server.send(409, F("application/json"), F("{\"err\":\"update in progress\"}"));
+      return;
+    }
+    otaStatus.state = OTA_CHECKING;
+    otaStatus.progress = 0;
+    otaStatus.error = "";
+    otaStatus.fileSize = 0;
+    xSemaphoreGive(otaMutex);
+  }
+
+  server.send(200, F("application/json"), F("{\"msg\":\"update started\"}"));
+  server.client().flush();
+  delay(100);
+
+  String* otaUrlPtr = new String(url);
+  
+  uint32_t freeHeap = ESP.getFreeHeap();
+  Serial.printf("Pre-OTA Free Heap: %u bytes\n", freeHeap);
+  
+  if (freeHeap < 50000) {
+    Serial.println(F("ERROR: Insufficient memory for OTA!"));
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      otaStatus.state = OTA_FAILED;
+      otaStatus.error = F("Insufficient memory");
+      xSemaphoreGive(otaMutex);
+    }
+    delete otaUrlPtr;
+    return;
+  }
+
+  BaseType_t taskCreated = xTaskCreate(
+    [](void* param) {
+      esp_task_wdt_add(NULL);
+      esp_task_wdt_reset();
+      
+      String* urlPtr = (String*)param;
+      String url = *urlPtr;
+      delete urlPtr;
+      
+      Serial.println(F("\n╔════════════════════════════════════════╗"));
+      Serial.println(F("║       OTA UPDATE STARTED               ║"));
+      Serial.println(F("╚════════════════════════════════════════╝"));
+      Serial.printf("URL: %s\n", url.c_str());
+      Serial.printf("Free Heap: %u bytes\n\n", ESP.getFreeHeap());
+      
+      vTaskDelay(pdMS_TO_TICKS(300));
+      esp_task_wdt_reset();
+      
+      deleteNonEssentialTasks();
+      esp_task_wdt_reset();
+      
+      // CRITICAL: Set flag to prevent WiFi management interference
+      otaInProgress = true;
+      Serial.println(F("OTA in progress flag set - WiFi management disabled"));
+      
+      if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        otaStatus.state = OTA_DOWNLOADING;
+        otaStatus.progress = 1;
+        xSemaphoreGive(otaMutex);
+      }
+      
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      Serial.println(F("WiFi power save disabled"));
+      
+      // Let WiFi stabilize
+      vTaskDelay(pdMS_TO_TICKS(200));
+      esp_task_wdt_reset();
+      
+      HTTPClient httpClient;
+      WiFiClientSecure clientSecure;
+      WiFiClient client;
+      
+      bool isSecure = url.startsWith("https://");
+      
+      // ALWAYS configure both clients upfront
+      clientSecure.setInsecure();
+      clientSecure.setTimeout(30);
+      client.setTimeout(30);
+      
+      if (isSecure) {
+        httpClient.begin(clientSecure, url);
+        Serial.println(F("Using HTTPS connection"));
+      } else {
+        httpClient.begin(client, url);
+        Serial.println(F("Using HTTP connection"));
+      }
+      
+      httpClient.setUserAgent(F("ESP32-OTA/1.0"));
+      httpClient.setTimeout(30000);
+      httpClient.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+      httpClient.setReuse(false);
+      
+      esp_task_wdt_reset();
+      
+      Serial.println(F("Sending HTTP GET request..."));
+      int httpCode = httpClient.GET();
+      
+// Handle redirects manually
+if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND || 
+    httpCode == HTTP_CODE_SEE_OTHER || httpCode == HTTP_CODE_TEMPORARY_REDIRECT) {
+  
+  String newLocation = httpClient.getLocation();
+  Serial.printf("Redirect %d to: %s\n", httpCode, newLocation.c_str());
+  
+  httpClient.end();
+  
+  // CRITICAL: Stop the previous client connection explicitly
+  if (isSecure) {
+    clientSecure.stop();
+    Serial.println(F("Stopped secure client"));
+  } else {
+    client.stop();
+    Serial.println(F("Stopped regular client"));
+  }
+  
+  // Give time for proper cleanup
+  vTaskDelay(pdMS_TO_TICKS(300));
+  esp_task_wdt_reset();
+  
+  bool newIsSecure = newLocation.startsWith("https://");
+  
+  // Reinitialize with the new URL and appropriate client
+  if (newIsSecure) {
+    Serial.println(F("Following redirect with HTTPS..."));
+    // Ensure secure client is ready
+    clientSecure.setInsecure();
+    clientSecure.setTimeout(30);
+    httpClient.begin(clientSecure, newLocation);
+  } else {
+    Serial.println(F("Following redirect with HTTP..."));
+    client.setTimeout(30);
+    httpClient.begin(client, newLocation);
+  }
+  
+  isSecure = newIsSecure;
+  httpClient.setUserAgent(F("ESP32-OTA/1.0"));
+  httpClient.setTimeout(30000);
+  httpClient.setReuse(false);
+  
+  // Give connection time to establish
+  vTaskDelay(pdMS_TO_TICKS(100));
+  esp_task_wdt_reset();
+  
+  Serial.println(F("Sending redirected GET request..."));
+  httpCode = httpClient.GET();
+  
+  Serial.printf("After redirect, HTTP code: %d\n", httpCode);
+}
+      
+      if (httpCode != HTTP_CODE_OK) {
+        char errStr[160];
+        String location = httpClient.getLocation();
+        if (location.length() > 0 && httpCode >= 300 && httpCode < 400) {
+          snprintf(errStr, sizeof(errStr), "HTTP %d -> %s", httpCode, location.c_str());
+        } else {
+          snprintf(errStr, sizeof(errStr), "HTTP %d: %s", 
+                   httpCode, httpClient.errorToString(httpCode).c_str());
+        }
+        Serial.printf("ERROR: %s\n", errStr);
+        
+        if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          otaStatus.state = OTA_FAILED;
+          otaStatus.error = errStr;
+          xSemaphoreGive(otaMutex);
+        }
+        
+        otaInProgress = false;
+        httpClient.end();
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_task_wdt_delete(NULL);
+        recreateTasks();
+        vTaskDelete(NULL);
+        return;
+      }
+      
+      int contentLength = httpClient.getSize();
+      if (contentLength <= 0) {
+        Serial.println(F("ERROR: Invalid Content-Length"));
+        
+        if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          otaStatus.state = OTA_FAILED;
+          otaStatus.error = F("Invalid content length");
+          xSemaphoreGive(otaMutex);
+        }
+        
+        otaInProgress = false;
+        httpClient.end();
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_task_wdt_delete(NULL);
+        recreateTasks();
+        vTaskDelete(NULL);
+        return;
+      }
+      
+      Serial.printf("✓ HTTP OK - Content-Length: %d bytes (%.2f MB)\n", 
+                    contentLength, contentLength / 1048576.0);
+      
+      if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        otaStatus.fileSize = contentLength;
+        xSemaphoreGive(otaMutex);
+      }
+      
+      esp_task_wdt_reset();
+      
+      const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
+      if (!update_partition) {
+        Serial.println(F("ERROR: No OTA partition available!"));
+        
+        if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          otaStatus.state = OTA_FAILED;
+          otaStatus.error = F("No OTA partition");
+          xSemaphoreGive(otaMutex);
+        }
+        
+        otaInProgress = false;
+        httpClient.end();
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_task_wdt_delete(NULL);
+        recreateTasks();
+        vTaskDelete(NULL);
+        return;
+      }
+      
+      if (contentLength > update_partition->size) {
+        char errStr[128];
+        snprintf(errStr, sizeof(errStr), 
+                 "File too large! %d > %u bytes", 
+                 contentLength, update_partition->size);
+        Serial.println(errStr);
+        
+        if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          otaStatus.state = OTA_FAILED;
+          otaStatus.error = errStr;
+          xSemaphoreGive(otaMutex);
+        }
+        
+        otaInProgress = false;
+        httpClient.end();
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_task_wdt_delete(NULL);
+        recreateTasks();
+        vTaskDelete(NULL);
+        return;
+      }
+      
+      Serial.printf("✓ Target partition: %s (%.2f MB)\n", 
+                    update_partition->label, update_partition->size / 1048576.0);
+      
+      Update.abort();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      esp_task_wdt_reset();
+      
+      Serial.println(F("\nStarting Update.begin()..."));
+      if (!Update.begin(contentLength, U_FLASH)) {
+        char errStr[128];
+        snprintf(errStr, sizeof(errStr), "Update.begin() error: %u", Update.getError());
+        Serial.printf("ERROR: %s\n", errStr);
+        Serial.println(Update.errorString());
+        
+        if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          otaStatus.state = OTA_FAILED;
+          otaStatus.error = errStr;
+          xSemaphoreGive(otaMutex);
+        }
+        
+        otaInProgress = false;
+        httpClient.end();
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_task_wdt_delete(NULL);
+        recreateTasks();
+        vTaskDelete(NULL);
+        return;
+      }
+      
+      Serial.println(F("✓ Update.begin() successful!"));
+      Serial.println(F("\n--- Starting Download & Flash ---"));
+      
+      esp_task_wdt_reset();
+      
+      WiFiClient* stream = isSecure ? (WiFiClient*)&clientSecure : &client;
+      
+      size_t written = 0;
+      unsigned long lastProgress = 0;
+      unsigned long lastWdtReset = 0;
+      uint8_t lastPrintedPercent = 0;
+      uint8_t buff[1024];
+      
+      while (written < contentLength) {
+        // Reset watchdog every 5 seconds
+        if (millis() - lastWdtReset > 5000) {
+          esp_task_wdt_reset();
+          lastWdtReset = millis();
+        }
+        
+        if (WiFi.status() != WL_CONNECTED) {
+          Serial.println(F("\nERROR: WiFi disconnected!"));
+          
+          if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            otaStatus.state = OTA_FAILED;
+            otaStatus.error = F("WiFi disconnected");
+            xSemaphoreGive(otaMutex);
+          }
+          
+          Update.abort();
+          otaInProgress = false;
+          httpClient.end();
+          esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+          esp_task_wdt_delete(NULL);
+          recreateTasks();
+          vTaskDelete(NULL);
+          return;
+        }
+        
+        size_t available = stream->available();
+        if (available) {
+          int len = stream->readBytes(buff, min(sizeof(buff), available));
+          
+          if (len > 0) {
+            if (Update.write(buff, len) != len) {
+              char errStr[128];
+              snprintf(errStr, sizeof(errStr), 
+                       "Write failed at %u/%d! Error: %u", 
+                       written, contentLength, Update.getError());
+              Serial.printf("\nERROR: %s\n", errStr);
+              
+              if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                otaStatus.state = OTA_FAILED;
+                otaStatus.error = errStr;
+                xSemaphoreGive(otaMutex);
+              }
+              
+              Update.abort();
+              otaInProgress = false;
+              httpClient.end();
+              esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+              esp_task_wdt_delete(NULL);
+              recreateTasks();
+              vTaskDelete(NULL);
+              return;
+            }
+            
+            written += len;
+            
+            if (millis() - lastProgress > 500 || written >= contentLength) {
+              lastProgress = millis();
+              uint8_t progress = (written * 100) / contentLength;
+              
+              if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                otaStatus.progress = progress;
+                xSemaphoreGive(otaMutex);
+              }
+              
+              if (progress / 10 > lastPrintedPercent / 10) {
+                Serial.printf("Progress: %u%% (%u/%d bytes)\n", 
+                             progress, written, contentLength);
+                lastPrintedPercent = progress;
+              }
+            }
+          }
+        }
+        
+        vTaskDelay(1);
+      }
+      
+      httpClient.end();
+      
+      Serial.printf("\n✓ Download complete! %u bytes written\n", written);
+      Serial.println(F("Finalizing update..."));
+      
+      esp_task_wdt_reset();
+      
+      if (!Update.end(true)) {
+        char errStr[128];
+        snprintf(errStr, sizeof(errStr), "Update.end() error: %u", Update.getError());
+        Serial.printf("ERROR: %s\n", errStr);
+        
+        if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          otaStatus.state = OTA_FAILED;
+          otaStatus.error = errStr;
+          xSemaphoreGive(otaMutex);
+        }
+        
+        otaInProgress = false;
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_task_wdt_delete(NULL);
+        recreateTasks();
+        vTaskDelete(NULL);
+        return;
+      }
+      
+      if (!Update.isFinished()) {
+        Serial.println(F("ERROR: Update not finished!"));
+        
+        if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          otaStatus.state = OTA_FAILED;
+          otaStatus.error = F("Update incomplete");
+          xSemaphoreGive(otaMutex);
+        }
+        
+        otaInProgress = false;
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_task_wdt_delete(NULL);
+        recreateTasks();
+        vTaskDelete(NULL);
+        return;
+      }
+      
+      Serial.println(F("\n╔════════════════════════════════════════╗"));
+      Serial.println(F("║      OTA UPDATE SUCCESS!               ║"));
+      Serial.println(F("╚════════════════════════════════════════╝"));
+      Serial.println(F("Rebooting in 2 seconds...\n"));
+      
+      if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        otaStatus.state = OTA_SUCCESS;
+        otaStatus.progress = 100;
+        xSemaphoreGive(otaMutex);
+      }
+      
+      otaInProgress = false;
+      esp_task_wdt_delete(NULL);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      ESP.restart();
+    },
+    "ota_task",
+    24576,
+    otaUrlPtr,
+    3,
+    NULL
+  );
+  
+  if (taskCreated != pdPASS) {
+    Serial.println(F("CRITICAL: Failed to create OTA task!"));
+    
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      otaStatus.state = OTA_FAILED;
+      otaStatus.error = F("Task creation failed");
+      xSemaphoreGive(otaMutex);
+    }
+    
+    delete otaUrlPtr;
+  }
+}
+
+static void handleOTAReset() {
+  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    otaStatus.state = OTA_IDLE;
+    otaStatus.progress = 0;
+    otaStatus.error = "";
+    xSemaphoreGive(otaMutex);
+  }
+  
+  recreateTasks();
+  
+  server.send(200, "application/json", "{\"msg\":\"OTA status reset and tasks restarted\"}");
+}
+#endif
+
+// ============================================================================
+// Message Pool
 // ============================================================================
 
 void initMessagePool() {
@@ -257,6 +1102,21 @@ void initMessagePool() {
     msgPool[i].inUse = false;
     msgPool[i].length = 0;
   }
+
+#if ENABLE_OTA
+  otaMutex = xSemaphoreCreateMutex();
+  taskDeletionMutex = xSemaphoreCreateMutex();
+  tasksDeleted = false;
+  webTaskShouldExit = false;
+  bizTaskShouldExit = false;
+  otaInProgress = false;
+  
+  const esp_partition_t* ota_partition = esp_ota_get_next_update_partition(NULL);
+  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    otaStatus.available = (ota_partition != NULL);
+    xSemaphoreGive(otaMutex);
+  }
+#endif
 }
 
 ExecMessage* allocMessage() {
@@ -282,11 +1142,6 @@ void freeMessage(ExecMessage* msg) {
 }
 
 void updateCpuLoad() {
-  // This function now just copies the CPU load from the main monitor,
-  // which is already calculating it correctly for the "top_tasks" list.
-  // We just invert the IDLE task's percentage.
-
-  // Find the IDLE0 task in our monitored data
   for (uint8_t i = 0; i < taskCount; i++) {
     if (taskData[i].name.equals("IDLE0") || (NUM_CORES == 1 && taskData[i].name.equals("IDLE"))) {
       coreLoadPct[0] = (taskData[i].cpuPercent > 100) ? 0 : (100 - taskData[i].cpuPercent);
@@ -439,7 +1294,7 @@ void sendBLE(const String& m) {
     pTxCharacteristic->notify();
   } else {
     for (size_t i = 0; i < len; i += 512) {
-      size_t chunk_size = (len - i > 512) ? 512 : (len - i);  // FIXED
+      size_t chunk_size = (len - i > 512) ? 512 : (len - i);
       pTxCharacteristic->setValue((uint8_t*)(data + i), chunk_size);
       pTxCharacteristic->notify();
       delay(20);
@@ -465,11 +1320,11 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
 };
 
 class BLECommandBuffer {
-private:
+ private:
   char buffer[MAX_BLE_CMD_LENGTH];
   size_t pos;
 
-public:
+ public:
   BLECommandBuffer()
     : pos(0) {
     buffer[0] = '\0';
@@ -628,6 +1483,23 @@ void handleBLECommand(String cmd) {
       netConfig.useDHCP = true;
       saveNetworkConfig();
       sendBLE("OK:DHCP_ON\n");
+
+      String ssid = prefs.getString("wifi_ssid", "");
+      String pass = prefs.getString("wifi_pass", "");
+      if (ssid.length() > 0) {
+        WiFi.disconnect(true, true);
+        delay(500);
+        WiFi.mode(WIFI_OFF);
+        delay(500);
+        WiFi.mode(WIFI_STA);
+        delay(100);
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        wifiState = WIFI_STATE_CONNECTING;
+        wifiLastConnectAttempt = millis();
+        wifiManualDisconnect = false;
+        wifiReconnectAttempts = 0;
+      }
+
     } else if (rest.startsWith("STATIC|") || rest.startsWith("static|")) {
       rest = rest.substring(7);
       int p1 = rest.indexOf('|');
@@ -648,6 +1520,26 @@ void handleBLECommand(String cmd) {
           netConfig.useDHCP = false;
           saveNetworkConfig();
           sendBLE("OK:STATIC_IP_SET\n");
+
+          String ssid = prefs.getString("wifi_ssid", "");
+          String pass = prefs.getString("wifi_pass", "");
+          if (ssid.length() > 0) {
+            WiFi.disconnect(true, true);
+            delay(500);
+            WiFi.mode(WIFI_OFF);
+            delay(500);
+            WiFi.mode(WIFI_STA);
+            delay(100);
+
+            WiFi.config(netConfig.staticIP, netConfig.gateway, netConfig.subnet, netConfig.dns);
+
+            WiFi.begin(ssid.c_str(), pass.c_str());
+            wifiState = WIFI_STATE_CONNECTING;
+            wifiLastConnectAttempt = millis();
+            wifiManualDisconnect = false;
+            wifiReconnectAttempts = 0;
+          }
+
         } else {
           sendBLE("ERR:INVALID_IP\n");
         }
@@ -755,6 +1647,11 @@ void setupWiFi() {
 }
 
 void checkWiFiConnection() {
+  #if ENABLE_OTA
+  // Don't manage WiFi during OTA - let OTA task handle it
+  if (otaInProgress) return;
+  #endif
+  
   if (wifiManualDisconnect) return;
 
   uint32_t now = millis();
@@ -779,23 +1676,34 @@ void checkWiFiConnection() {
     case WIFI_STATE_CONNECTING:
       if (status == WL_CONNECTED) {
         wifiState = WIFI_STATE_CONNECTED;
-        wifiReconnectAttempts = 0;
+        wifiReconnectAttempts = 0;  // ✅ Reset on successful connection
+        wifiLastConnectAttempt = now;  // ✅ Update timestamp
       } else if (now - wifiLastConnectAttempt > WIFI_CONNECT_TIMEOUT) {
         wifiState = WIFI_STATE_DISCONNECTED;
+        wifiLastConnectAttempt = now;  // ✅ Update for backoff calculation
       }
       break;
 
     case WIFI_STATE_CONNECTED:
       if (status != WL_CONNECTED) {
         wifiState = WIFI_STATE_DISCONNECTED;
+        wifiLastConnectAttempt = now;  // ✅ Update when disconnecting
+      } else {
+        // ✅ NEW: Reset reconnect attempts after sustained connection (5 minutes)
+        if (wifiReconnectAttempts > 0 && (now - wifiLastConnectAttempt > 300000)) {
+          wifiReconnectAttempts = 0;
+        }
       }
       break;
 
     case WIFI_STATE_DISCONNECTED:
-      uint8_t maxShift = min(wifiReconnectAttempts, (uint8_t)4);
-      uint32_t backoffDelay = WIFI_RECONNECT_DELAY * (1 << maxShift);
-      if (now - wifiLastConnectAttempt > backoffDelay) {
-        wifiState = WIFI_STATE_IDLE;
+      {
+        uint8_t maxShift = min(wifiReconnectAttempts, (uint8_t)4);
+        uint32_t backoffDelay = WIFI_RECONNECT_DELAY * (1 << maxShift);
+        if (now - wifiLastConnectAttempt > backoffDelay) {
+          wifiState = WIFI_STATE_IDLE;
+          // wifiLastConnectAttempt will be updated when entering CONNECTING state
+        }
       }
       break;
   }
@@ -838,7 +1746,7 @@ static inline BaseType_t getSafeAffinity(TaskHandle_t handle) {
 }
 
 // ============================================================================
-// Per-Core Task Monitoring (Main Algorithm)
+// Per-Core Task Monitoring
 // ============================================================================
 
 void updateTaskMonitoring() {
@@ -849,7 +1757,6 @@ void updateTaskMonitoring() {
   UBaseType_t numTasks = uxTaskGetSystemState(statusArray, MAX_TASKS_MONITORED, NULL);
   if (numTasks == 0) return;
 
-  // Reset per-core counters
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].totalRuntime100ms = 0;
     coreRuntime[c].taskCount = 0;
@@ -857,7 +1764,6 @@ void updateTaskMonitoring() {
   }
   noAffinityRuntime100ms = 0;
 
-  // Calculate per-core totals
   for (uint8_t j = 0; j < numTasks; j++) {
     BaseType_t affinity = getSafeAffinity(statusArray[j].xHandle);
     uint32_t runtime = statusArray[j].ulRunTimeCounter;
@@ -870,14 +1776,12 @@ void updateTaskMonitoring() {
     }
   }
 
-  // Calculate per-core deltas
   uint64_t coreDelta[2] = { 0, 0 };
   for (int c = 0; c < NUM_CORES; c++) {
     coreDelta[c] = coreRuntime[c].totalRuntime100ms - coreRuntime[c].prevTotalRuntime100ms;
     if (coreDelta[c] == 0) coreDelta[c] = 1;
   }
 
-  // First time initialization
   if (!statsInitialized) {
     taskCount = min(numTasks, (UBaseType_t)MAX_TASKS_MONITORED);
     for (uint8_t i = 0; i < taskCount; i++) {
@@ -886,7 +1790,7 @@ void updateTaskMonitoring() {
       taskData[i].state = statusArray[i].eCurrentState;
       taskData[i].runtime = statusArray[i].ulRunTimeCounter;
       taskData[i].prevRuntime = statusArray[i].ulRunTimeCounter;
-      taskData[i].runtimeAccumUs = 0;  // ✅ FIX: Start at 0
+      taskData[i].runtimeAccumUs = 0;
       taskData[i].stackHighWater = statusArray[i].xHandle ? uxTaskGetStackHighWaterMark(statusArray[i].xHandle) : 0;
       taskData[i].stackHealth = getStackHealth(taskData[i].stackHighWater);
       taskData[i].cpuPercent = 0;
@@ -900,20 +1804,16 @@ void updateTaskMonitoring() {
     return;
   }
 
-  // Update existing tasks with per-core CPU calculation
   for (uint8_t i = 0; i < taskCount; i++) {
     bool found = false;
     for (uint8_t j = 0; j < numTasks; j++) {
       if (taskData[i].handle == statusArray[j].xHandle) {
         uint32_t currentRuntime100ms = statusArray[j].ulRunTimeCounter;
 
-        // ✅ FIX: Calculate runtime delta with proper overflow handling
         uint32_t taskDelta;
         if (currentRuntime100ms >= taskData[i].prevRuntime) {
-          // Normal case: no overflow
           taskDelta = currentRuntime100ms - taskData[i].prevRuntime;
         } else {
-          // Overflow case: counter wrapped around
           taskDelta = (0xFFFFFFFF - taskData[i].prevRuntime) + currentRuntime100ms + 1;
         }
 
@@ -928,7 +1828,6 @@ void updateTaskMonitoring() {
           coreAccumUs[affinity] += taskDelta;
         }
 
-        // Calculate CPU% based on core affinity
         if (affinity == tskNO_AFFINITY) {
           uint64_t totalCoreDelta = 0;
           for (int c = 0; c < NUM_CORES; c++) totalCoreDelta += coreDelta[c];
@@ -967,7 +1866,6 @@ void updateTaskMonitoring() {
     }
   }
 
-  // Add new tasks
   for (uint8_t j = 0; j < numTasks && taskCount < MAX_TASKS_MONITORED; j++) {
     bool exists = false;
     for (uint8_t i = 0; i < taskCount; i++) {
@@ -982,7 +1880,7 @@ void updateTaskMonitoring() {
       taskData[taskCount].state = statusArray[j].eCurrentState;
       taskData[taskCount].runtime = statusArray[j].ulRunTimeCounter;
       taskData[taskCount].prevRuntime = statusArray[j].ulRunTimeCounter;
-      taskData[taskCount].runtimeAccumUs = 0;  // ✅ FIX: Start at 0
+      taskData[taskCount].runtimeAccumUs = 0;
       taskData[taskCount].stackHighWater = statusArray[j].xHandle ? uxTaskGetStackHighWaterMark(statusArray[j].xHandle) : 0;
       taskData[taskCount].stackHealth = getStackHealth(taskData[taskCount].stackHighWater);
       taskData[taskCount].cpuPercent = 0;
@@ -992,7 +1890,6 @@ void updateTaskMonitoring() {
     }
   }
 
-  // Store totals for next sample
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].prevTotalRuntime100ms = coreRuntime[c].totalRuntime100ms;
   }
@@ -1034,7 +1931,19 @@ static void handleApiStatus() {
   doc["num_cores"] = NUM_CORES;
   doc["temp_c"] = getInternalTemperatureC();
 
-  // Memory information
+#if ENABLE_OTA
+  JsonObject ota = doc.createNestedObject("ota");
+  ota["enabled"] = true;
+  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    ota["available"] = otaStatus.available;
+    ota["state"] = (uint8_t)otaStatus.state;
+    xSemaphoreGive(otaMutex);
+  }
+#else
+  JsonObject ota = doc.createNestedObject("ota");
+  ota["enabled"] = false;
+#endif
+
   MemoryInfo memInfo = getMemoryInfo();
   JsonObject memory = doc.createNestedObject("memory");
   memory["flash_mb"] = memInfo.flashSizeMB;
@@ -1067,7 +1976,6 @@ void sendTaskMonitoring() {
 
   uint8_t activeTaskCount = 0;
   for (uint8_t i = 0; i < taskCount; i++) {
-    // Skip deleted tasks
     if (taskData[i].state == eDeleted) continue;
     activeTaskCount++;
 
@@ -1104,6 +2012,10 @@ void sendTaskMonitoring() {
 // ============================================================================
 
 void hNetworkConfig() {
+  if (isOtaActive()) {
+    sendBusyJson(server);
+    return;
+  }
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"err\":\"no body\"}");
     return;
@@ -1153,6 +2065,10 @@ void hNetworkConfig() {
 }
 
 void hExec() {
+  if (isOtaActive()) {
+    sendBusyJson(server);
+    return;
+  }
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"err\":\"no body\"}");
     return;
@@ -1165,8 +2081,17 @@ void hExec() {
     return;
   }
 
-  const char* cmd = doc["cmd"] | "";
-  size_t cmdLen = strlen(cmd);
+  String cmdStr = doc["cmd"] | "";
+  cmdStr.trim();
+
+  if (cmdStr.equalsIgnoreCase("reset")) {
+    server.send(200, "application/json", "{\"msg\":\"Rebooting...\"}");
+    delay(100);
+    ESP.restart();
+    return;
+  }
+
+  size_t cmdLen = cmdStr.length();
   if (cmdLen == 0 || cmdLen >= MAX_MSG_SIZE) {
     server.send(400, "application/json", "{\"err\":\"invalid cmd\"}");
     return;
@@ -1178,7 +2103,7 @@ void hExec() {
     return;
   }
 
-  memcpy(msg->payload, cmd, cmdLen);
+  memcpy(msg->payload, cmdStr.c_str(), cmdLen);
   msg->payload[cmdLen] = '\0';
   msg->length = cmdLen;
 
@@ -1191,17 +2116,25 @@ void hExec() {
 }
 
 void hBizStart() {
+  if (isOtaActive()) {
+    sendBusyJson(server);
+    return;
+  }
   gBizState = BIZ_RUNNING;
   server.send(200, "application/json", "{\"msg\":\"started\"}");
 }
 
 void hBizStop() {
+  if (isOtaActive()) {
+    sendBusyJson(server);
+    return;
+  }
   gBizState = BIZ_STOPPED;
   server.send(200, "application/json", "{\"msg\":\"stopped\"}");
 }
 
 // ============================================================================
-// HTML Dashboard
+// HTML Dashboard (same as before)
 // ============================================================================
 
 static const char INDEX_HTML_PART1[] PROGMEM = R"rawliteral(
@@ -1218,6 +2151,15 @@ body {font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#0d1117
 h1 {text-align:center;margin-bottom:12px;font-size:1.8em;background:linear-gradient(90deg,#58a6ff,#bc8cff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .card {background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px;box-shadow:0 4px 8px rgba(0,0,0,0.4)}
 .card h3 {margin-bottom:8px;color:#58a6ff;font-size:1.1em;border-bottom:1px solid #21262d;padding-bottom:6px}
+.card.condensed { padding: 8px; }
+.card.condensed h3 { font-size: 1.05em; margin-bottom: 6px; padding-bottom: 4px; }
+.card.condensed .form-group { margin-bottom: 6px; }
+.card.condensed .form-group label { margin-bottom: 2px; font-size: 0.8em; }
+.card.condensed input[type="text"], .card.condensed input[type="password"] { padding: 6px; font-size: 0.85em; }
+.card.condensed .btn { padding: 6px 10px; font-size: 0.85em; }
+.card.condensed .alert { padding: 6px; margin-bottom: 6px; font-size: 0.8em; }
+.card.condensed .pill { padding: 3px 8px; font-size: 0.75em; }
+.card.condensed .row { margin-bottom: 4px; }
 h4 {color:#58a6ff;font-size:1em;margin-bottom:6px}
 .row {display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px}
 .pill {background:#21262d;padding:4px 10px;border-radius:12px;font-size:0.8em;white-space:nowrap;border:1px solid #30363d}
@@ -1295,7 +2237,7 @@ pre {background:#0d1117;color:#c9d1d9;padding:10px;border-radius:4px;overflow-x:
   <div class="pill" id="ipInfo">IP: -</div>
   <div class="pill" id="rssiInfo">RSSI: --</div>
   <div class="pill">Up: <span id="upt">--:--:--</span></div>
-  <div class="pill">Free Heap: <span id="heap">--</span>/<span id="heapTot">--</span></div>  
+  <div class="pill">Free Heap: <span id="heap">--</span>/<span id="heapTot">--</span></div>
   <div class="pill">Temp: <span id="tempC">--</span></div>
   <div class="pill"><span class="core-badge core-0">C0</span> <span id="c0">-</span>% (<span id="c0Tasks">-</span> tasks)</div>
   <div class="pill" id="c1pill"><span class="core-badge core-1">C1</span> <span id="c1">-</span>% (<span id="c1Tasks">-</span> tasks)</div>
@@ -1305,26 +2247,33 @@ pre {background:#0d1117;color:#c9d1d9;padding:10px;border-radius:4px;overflow-x:
   <div class="pill" id="psramPill" style="display:none">PSRAM: <span id="psramUsed">--</span>/<span id="psramTotal">--</span></div>
  </div>
 </div>
-<div class="grid">
- <div class="card">
-  <h3>Business Module</h3>
-  <div id="bizStatus" class="alert info">Status: <span id="bizState">Loading...</span></div>
-  <div class="row">
-   <button class="btn primary" onclick="startBiz()">Start</button>
-   <button class="btn danger" onclick="stopBiz()">Stop</button>
-   <div class="pill">Q:<span id="bizQueue">-</span> | Proc:<span id="bizProcessed">-</span></div>
-  </div>
- </div>
- <div class="card">
-  <h3>Command Exec</h3>
-  <div class="form-group">
-   <input type="text" id="execCmd" placeholder="Enter command...">
-  </div>
-  <button class="btn primary" onclick="execCommand()">Execute</button>
-  <div id="execResult"></div>
+)rawliteral";
+
+static const char INDEX_HTML_BIZ_CARD[] PROGMEM = R"rawliteral(
+<div class="card condensed">
+ <h3>Business Module</h3>
+ <div id="bizStatus" class="alert info">Status: <span id="bizState">Loading...</span></div>
+ <div class="row">
+  <button class="btn primary" onclick="startBiz()">Start</button>
+  <button class="btn danger" onclick="stopBiz()">Stop</button>
+  <div class="pill">Q:<span id="bizQueue">-</span> | Proc:<span id="bizProcessed">-</span></div>
  </div>
 </div>
-<div class="card">
+)rawliteral";
+
+static const char INDEX_HTML_CMD_CARD[] PROGMEM = R"rawliteral(
+<div class="card condensed">
+ <h3>Command Exec</h3>
+ <div class="form-group">
+  <input type="text" id="execCmd" placeholder="Enter command...">
+ </div>
+ <button class="btn primary" onclick="execCommand()">Execute</button>
+ <div id="execResult"></div>
+</div>
+)rawliteral";
+
+static const char INDEX_HTML_WIFI_CARD[] PROGMEM = R"rawliteral(
+<div class="card condensed">
  <h3>WiFi Config</h3>
  <div class="grid">
   <div>
@@ -1341,13 +2290,23 @@ pre {background:#0d1117;color:#c9d1d9;padding:10px;border-radius:4px;overflow-x:
    </div>
   </div>
   <div id="staticIpFields" style="display:none">
-   <div class="form-group">
-    <label>Static IP</label>
-    <input type="text" id="staticIp" placeholder="192.168.1.100">
-   </div>
-   <div class="form-group">
-    <label>Gateway</label>
-    <input type="text" id="gateway" placeholder="192.168.1.1">
+   <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+    <div class="form-group" style="margin-bottom:4px">
+     <label style="font-size:0.75em">Static IP</label>
+     <input type="text" id="staticIp" placeholder="192.168.1.100" style="padding:5px;font-size:0.8em">
+    </div>
+    <div class="form-group" style="margin-bottom:4px">
+     <label style="font-size:0.75em">Gateway</label>
+     <input type="text" id="gateway" placeholder="192.168.1.1" style="padding:5px;font-size:0.8em">
+    </div>
+    <div class="form-group" style="margin-bottom:4px">
+     <label style="font-size:0.75em">Subnet</label>
+     <input type="text" id="subnet" placeholder="255.255.255.0" style="padding:5px;font-size:0.8em">
+    </div>
+    <div class="form-group" style="margin-bottom:4px">
+     <label style="font-size:0.75em">DNS</label>
+     <input type="text" id="dns" placeholder="8.8.8.8" style="padding:5px;font-size:0.8em">
+    </div>
    </div>
   </div>
  </div>
@@ -1365,15 +2324,234 @@ static const char INDEX_HTML_TASKS[] PROGMEM = R"rawliteral(
 )rawliteral";
 #endif
 
+
+#if ENABLE_OTA
+static const char INDEX_HTML_OTA[] PROGMEM = R"rawliteral(
+<div class="card condensed">
+ <h3>OTA Firmware Update</h3>
+ <div id="otaStatus" class="alert info">Status: <span id="otaState">Checking...</span></div>
+ <div id="otaAvailable" style="display:none">
+  <div class="form-group">
+   <label>Firmware URL</label>
+   <input type="text" id="otaUrl" placeholder="http://example.com/firmware.bin">
+  </div>
+    <div class="row" style="font-size: 0.9em; gap: 8px;">
+    <style>#otaAvailable .pill strong { color: #58a6ff; }</style>
+    <div class="pill">Running: <strong id="currentPartition">-</strong></div>
+    <div class="pill">Target: <strong id="targetPartition" style="color:#d29922">-</strong></div>
+    <div class="pill">Target Size: <strong id="targetSize">-</strong></div>
+    <div class="pill">Free Space: <strong id="freeSpace">-</strong></div>
+    <div class="pill">Current Sketch: <strong id="sketchSize">-</strong></div>
+  </div>
+    <div id="otaProgress" style="display:none;margin-bottom:6px">
+   <div class="progress-bar" style="height:12px">
+    <div class="progress-fill" id="otaProgressBar" style="width:0%"></div>
+   </div>
+   <p style="text-align:center;margin-top:4px;font-size:0.8em"><span id="otaProgressText">0</span>%</p>
+  </div>
+  <div class="row">
+   <button class="btn primary" id="otaUpdateBtn" onclick="startOTAUpdate()">Start Update</button>
+   <button class="btn secondary" id="otaResetBtn" onclick="resetOTA()" style="display:none">Reset</button>
+  </div>
+ </div>
+ <div id="otaNotAvailable" style="display:none">
+  <p style="color:#f85149;font-size:0.9em;">OTA updates are not available.</p>
+ </div>
+</div>
+)rawliteral";
+#endif
+
 static const char INDEX_HTML_PART2[] PROGMEM = R"rawliteral(
 </div>
 <script>
 const I=id=>document.getElementById(id);
+let otaInterval = null;
+
+async function refreshOTA(){
+const j=await api('/api/ota/status');
+if(j.error)return;
+
+const otaAvail=document.getElementById('otaAvailable');
+const otaNotAvail=document.getElementById('otaNotAvailable');
+const otaStateEl=I('otaState');
+const otaStatusEl=document.getElementById('otaStatus');
+const otaProgressDiv=document.getElementById('otaProgress');
+const otaUpdateBtn=document.getElementById('otaUpdateBtn');
+const otaResetBtn=document.getElementById('otaResetBtn');
+
+if(!j.available){
+ if(otaAvail)otaAvail.style.display='none';
+ if(otaNotAvail)otaNotAvail.style.display='block';
+ otaStateEl.textContent='Not Available';
+ return;
+}
+
+if(otaAvail)otaAvail.style.display='block';
+if(otaNotAvail)otaNotAvail.style.display='none';
+
+const states=['Idle','Checking','Downloading','Success','Failed'];
+otaStateEl.textContent=states[j.state]||'Unknown';
+
+if(j.state===0){
+ otaStatusEl.className='alert info';
+ if(otaProgressDiv)otaProgressDiv.style.display='none';
+ if(otaUpdateBtn)otaUpdateBtn.disabled=false;
+ if(otaResetBtn)otaResetBtn.style.display='none';
+}else if(j.state===1||j.state===2){
+ otaStatusEl.className='alert info';
+ if(otaProgressDiv)otaProgressDiv.style.display='block';
+ I('otaProgressBar').style.width=j.progress+'%';
+ 
+   let progressText = j.progress;
+   if (j.file_size > 0) {
+       const downloaded = fmB((j.file_size * j.progress) / 100);
+       const total = fmB(j.file_size);
+       progressText = `${j.progress}% (${downloaded} / ${total})`;
+   } else {
+       progressText = `${j.progress}%`;
+   }
+   I('otaProgressText').textContent = progressText;
+
+ if(otaUpdateBtn)otaUpdateBtn.disabled=true;
+ if(otaResetBtn)otaResetBtn.style.display='none';
+}else if(j.state===3){
+ otaStatusEl.className='alert success';
+ otaStateEl.textContent='Success - Rebooting...';
+ if(otaProgressDiv)otaProgressDiv.style.display='block';
+ I('otaProgressBar').style.width='100%';
+ I('otaProgressText').textContent='100%';
+ if(otaUpdateBtn)otaUpdateBtn.disabled=true;
+ if(otaResetBtn)otaResetBtn.style.display='none';
+}else if(j.state===4){
+ otaStatusEl.className='alert error';
+ otaStateEl.textContent='Failed: '+j.error;
+ if(otaProgressDiv)otaProgressDiv.style.display='none';
+ if(otaUpdateBtn)otaUpdateBtn.disabled=false;
+ if(otaResetBtn)otaResetBtn.style.display='inline-block';
+}
+
+if(j.current_partition)I('currentPartition').textContent=j.current_partition;
+if(j.next_partition)I('targetPartition').textContent=j.next_partition;
+if(j.partition_size)I('targetSize').textContent=fmB(j.partition_size);
+if(j.sketch_size)I('sketchSize').textContent=fmB(j.sketch_size);
+if(j.free_sketch_space)I('freeSpace').textContent=fmB(j.free_sketch_space);
+}
+
+async function startOTAUpdate(){
+ const url=I('otaUrl').value.trim();
+ if(!url){alert('Enter firmware URL');return;}
+ if(!url.startsWith('http')){alert('URL must start with http:// or https://');return;}
+ if(!confirm('Start OTA update? Device will reboot after successful update.')){return;}
+ 
+ const r=await api('/api/ota/update','POST',{url});
+ 
+ if(r.error||r.err){
+   alert('Error: '+(r.error||r.err));
+   refreshOTA();
+ }
+ else{
+   // Transform the page to show OTA progress immediately
+   showOTAProgress();
+ }
+}
+
+function showOTAProgress(){
+  // Hide everything except a progress card
+  document.body.innerHTML = `
+<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;
+background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;
+min-height:100vh;margin:0">
+<div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;max-width:420px;width:90%">
+ <h3 style="color:#58a6ff;margin:0 0 8px 0" id="otaTitle">Updating firmware...</h3>
+ <p style="margin:0 0 12px 0;color:#8b949e;font-size:0.9em" id="otaStatusText">Device is applying an update. Please wait...</p>
+ <div style="height:10px;background:#21262d;border:1px solid #30363d;border-radius:6px;overflow:hidden">
+  <div style="height:100%;width:1%;background:linear-gradient(90deg,#238636,#3fb950);transition:width 0.4s ease;" id="otaFill"></div>
+ </div>
+ <p style="color:#8b949e;font-size:12px;margin-top:8px;text-align:center;min-height:1em" id="otaProgressText">Starting...</p>
+</div>
+</div>`;
+
+  // Start polling for progress
+  pollOTAProgress();
+}
+
+async function pollOTAProgress(){
+  try{
+    const r = await fetch('/api/ota/status');
+    const j = await r.json();
+    
+    const fill = document.getElementById('otaFill');
+    const prog = document.getElementById('otaProgressText');
+    const title = document.getElementById('otaTitle');
+    const status = document.getElementById('otaStatusText');
+    
+    if(!j) { 
+      setTimeout(pollOTAProgress, 1000); 
+      return; 
+    }
+
+    // If OTA finished or failed, reload to main page
+    if(j.state === 0 || j.state === 3 || j.state === 4){ 
+      setTimeout(() => location.reload(), 2000);
+      if(j.state === 3) {
+        title.textContent = 'Update Complete!';
+        status.textContent = 'Device will reboot shortly...';
+        fill.style.width = '100%';
+        prog.textContent = '100% - Rebooting...';
+      } else if(j.state === 4) {
+        title.textContent = 'Update Failed';
+        status.textContent = 'Error: ' + (j.error || 'Unknown error');
+        prog.textContent = 'Returning to dashboard...';
+      }
+      return; 
+    }
+
+    if(j.state === 1) {
+      title.textContent = 'Checking...';
+      status.textContent = 'Preparing firmware update...';
+      prog.textContent = 'Initializing...';
+      fill.style.width = '1%';
+    } else if (j.state === 2) {
+      title.textContent = 'Downloading...';
+      status.textContent = 'Downloading new firmware. Do not unplug.';
+      const p = j.progress || 0;
+      fill.style.width = p + '%';
+      
+      let pText = p + '%';
+      if (j.file_size > 0) {
+        const downloaded = fmB((j.file_size * p) / 100);
+        const total = fmB(j.file_size);
+        pText = `${p}% (${downloaded} / ${total})`;
+      }
+      
+      if (p >= 99) {
+        title.textContent = 'Flashing...';
+        status.textContent = 'Download complete. Writing to flash...';
+        prog.textContent = 'This may take a minute. Device will reboot.';
+      } else {
+        prog.textContent = pText;
+      }
+    }
+  }catch(e){
+    document.getElementById('otaProgressText').textContent = 'Connection lost. Retrying...';
+  }
+  
+  setTimeout(pollOTAProgress, 800);
+}
+
+async function resetOTA(){
+ const r=await api('/api/ota/reset','POST');
+ if(!r.error){refreshOTA();}
+}
 async function api(path,method='GET',body=null){
  try{
   const opts={method};
   if(body){opts.headers={'Content-Type':'application/json'};opts.body=JSON.stringify(body);}
   const r=await fetch(path,opts);
+  if(r.status === 503) {
+    console.warn('Server is busy (OTA in progress).');
+    return { error: 'ota_active' };
+  }
   return await r.json();
  }catch(e){return{error:e.message}}
 }
@@ -1384,12 +2562,13 @@ function healthCls(v){return'health-'+v}
 function stCls(v){return'state-'+v.toLowerCase()}
 function coreCls(c){if(c==='ANY')return'core-any';if(c==='0')return'core-0';if(c==='1')return'core-1';return'core-any';}
 I('wifiDhcp').addEventListener('change',()=>{I('staticIpFields').style.display=I('wifiDhcp').checked?'none':'block';});
-async function startBiz(){const r=await api('/api/biz/start','POST');if(!r.error){I('bizState').textContent='RUNNING';refresh();}}
-async function stopBiz(){const r=await api('/api/biz/stop','POST');if(!r.error){I('bizState').textContent='STOPPED';refresh();}}
+async function startBiz(){const r=await api('/api/biz/start','POST');if(r.error)return;if(!r.error){I('bizState').textContent='RUNNING';refresh();}}
+async function stopBiz(){const r=await api('/api/biz/stop','POST');if(r.error)return;if(!r.error){I('bizState').textContent='STOPPED';refresh();}}
 async function execCommand(){
  const cmd=I('execCmd').value.trim();
  if(!cmd){alert('Enter a command');return;}
  const r=await api('/api/exec','POST',{cmd});
+ if(r.error)return;
  const res=I('execResult');
  if(r.error||r.err){res.innerHTML='<div class="alert error">'+(r.error||r.err)+'</div>';}
  else{res.innerHTML='<div class="alert success">'+r.msg+'</div>';I('execCmd').value='';}
@@ -1401,39 +2580,23 @@ async function saveNetwork(){
  const dhcp=I('wifiDhcp').checked;
  if(!ssid){alert('Enter SSID');return;}
  const body={ssid,pass,dhcp};
- if(!dhcp){body.static_ip=I('staticIp').value;body.gateway=I('gateway').value;}
+ if(!dhcp){
+  body.static_ip=I('staticIp').value;
+  body.gateway=I('gateway').value;
+  body.subnet=I('subnet').value;
+  body.dns=I('dns').value;
+ }
  const r=await api('/api/network','POST',body);
+ if(r.error)return;
  const res=I('networkResult');
  if(r.error||r.err){res.innerHTML='<div class="alert error">'+(r.error||r.err)+'</div>';}
  else{res.innerHTML='<div class="alert success">'+r.msg+'</div>';}
  setTimeout(()=>res.innerHTML='',5000);
 }
 async function refreshTasks(){
- const taskMonitorEl = I('taskMonitor');
- if(!taskMonitorEl) return; // ✅ Exit early if Tasks card doesn't exist
- 
  const j=await api('/api/tasks');
  if(j.error)return;
- if(!j.tasks){taskMonitorEl.innerHTML='<p style="text-align:center;color:#8b949e">No tasks</p>';return;}
- j.tasks.sort((a,b)=>(b.runtime||0)-(a.runtime||0));
- let h='<div class="task-table-wrapper"><table class="task-table"><thead><tr><th>Task</th><th>Core</th><th>Pri</th><th>Stack</th><th>State</th><th>CPU%</th><th>Runtime</th></tr></thead><tbody>';
- j.tasks.forEach(t=>{
-  const cpuPct = Math.min(100, t.cpu_percent || 0);
-  h+=`<tr>
-   <td class="task-name">${t.name}</td>
-   <td><span class="core-badge ${coreCls(t.core)}">${t.core}</span></td>
-   <td>${t.priority}</td>
-   <td><span class="${healthCls(t.stack_health)}">${t.stack_hwm}</span></td>
-   <td><span class="task-state ${stCls(t.state)}">${t.state}</span></td>
-   <td><span class="cpu-badge ${cpuCls(cpuPct)}">${cpuPct}%</span>
-     <div class="progress-bar"><div class="progress-fill" style="width:${cpuPct}%"></div></div></td>
-   <td>${fmU((t.runtime||0)*1000)}</td>
-  </tr>`;
- });
- h+='</tbody></table></div>';
- taskMonitorEl.innerHTML=h;
  
- // Update task count in System Status (always present)
  I('taskCount').textContent=j.task_count||'-';
  if(j.core_summary){
   if(j.core_summary['0']){
@@ -1443,10 +2606,40 @@ async function refreshTasks(){
    I('c1Tasks').textContent=j.core_summary['1'].tasks||'0';
   }
  }
+ 
+ const taskMonitorEl = I('taskMonitor');
+ if(!taskMonitorEl) return;
+ 
+ if(!j.tasks){taskMonitorEl.innerHTML='<p style="text-align:center;color:#8b949e">No tasks</p>';return;}
+ j.tasks.sort((a,b)=>(b.runtime||0)-(a.runtime||0));
+ let h='<div class="task-table-wrapper"><table class="task-table"><thead><tr><th>Task</th><th>Core</th><th>Pri</th><th>Stack</th><th>State</th><th>CPU%</th><th>Runtime</th></tr></thead><tbody>';
+ j.tasks.forEach(t=>{
+  const cpuPct = Math.min(100, t.cpu_percent || 0);
+  h+=`<tr>
+    <td class="task-name">${t.name}</td>
+    <td><span class="core-badge ${coreCls(t.core)}">${t.core}</span></td>
+    <td>${t.priority}</td>
+    <td><span class="${healthCls(t.stack_health)}">${t.stack_hwm}</span></td>
+    <td><span class="task-state ${stCls(t.state)}">${t.state}</span></td>
+    <td><span class="cpu-badge ${cpuCls(cpuPct)}">${cpuPct}%</span>
+     <div class="progress-bar"><div class="progress-fill" style="width:${cpuPct}%"></div></div></td>
+    <td>${fmU((t.runtime||0)*1000)}</td>
+  </tr>`;
+ });
+ h+='</tbody></table></div>';
+ taskMonitorEl.innerHTML=h;
 }
 async function refresh(){
  const j=await api('/api/status');
- if(j.error)return;
+ if(j.error) {
+  if (j.error === 'ota_active') {
+  }
+  return;
+ }
+ if(j.ota_active) {
+  location.reload();
+  return;
+ }
  I('bleDot').classList.toggle('on',!!j.ble);
  I('wifiDot').classList.toggle('on',!!j.connected);
  I('ipInfo').textContent=`IP: ${j.ip||'-'}`;
@@ -1461,7 +2654,6 @@ async function refresh(){
  if(j.temp_c===null||j.temp_c===undefined){I('tempC').textContent='n/a';}
  else{I('tempC').textContent=j.temp_c.toFixed?j.temp_c.toFixed(1)+'°C':j.temp_c+'°C';}
  
- // Memory information
  if(j.memory){
   I('flashSize').textContent=j.memory.flash_mb||'--';
   if(j.memory.has_psram){
@@ -1484,24 +2676,76 @@ async function refresh(){
 )rawliteral";
 
 static const char INDEX_HTML_END[] PROGMEM = R"rawliteral(
-setInterval(refresh,2000);
-setInterval(refreshTasks,3000);
+const refreshInterval = setInterval(refresh,2000);
+const taskInterval = setInterval(refreshTasks,3000);
 refresh();
 refreshTasks();
+if(document.getElementById('otaAvailable')){
+ otaInterval = setInterval(refreshOTA,2000);
+ refreshOTA();
+}
 </script>
 </body>
 </html>
 )rawliteral";
 
+static void register_guarded_routes() {
+  server.on("/", HTTP_GET, []() {
+    sendIndex_guarded();
+  });
+  server.on("/api/status", HTTP_GET, []() {
+    handleApiStatus_guarded();
+  });
+  server.on("/api/tasks", HTTP_GET, []() {
+    sendTaskMonitoring_guarded();
+  });
+
+  server.on("/api/network", HTTP_POST, hNetworkConfig);
+  server.on("/api/exec", HTTP_POST, hExec);
+  server.on("/api/biz/start", HTTP_POST, hBizStart);
+  server.on("/api/biz/stop", HTTP_POST, hBizStop);
+
+#if ENABLE_OTA
+  server.on("/api/ota/status", HTTP_GET, handleOTAStatus);
+  server.on("/api/ota/update", HTTP_POST, handleOTAUpdate);
+  server.on("/api/ota/reset", HTTP_POST, handleOTAReset);
+  server.on("/api/ota/info", HTTP_GET, handleOTAInfo);
+#endif
+  server.onNotFound([]() {
+    server.send(404, "application/json", "{\"err\":\"not found\"}");
+  });
+}
+
+
 static void sendIndex() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
+
   server.sendContent_P(INDEX_HTML_PART1);
   delay(1);
+
+  server.sendContent_P(PSTR("<div class=\"grid\">"));
+  delay(1);
+
+  server.sendContent_P(INDEX_HTML_BIZ_CARD);
+  delay(1);
+  server.sendContent_P(INDEX_HTML_CMD_CARD);
+  delay(1);
+  server.sendContent_P(INDEX_HTML_WIFI_CARD);
+  delay(1);
+#if ENABLE_OTA
+  server.sendContent_P(INDEX_HTML_OTA);
+  delay(1);
+#endif
+
+  server.sendContent_P(PSTR("</div>"));
+  delay(1);
+
 #if DEBUG_MODE
   server.sendContent_P(INDEX_HTML_TASKS);
   delay(1);
 #endif
+
   server.sendContent_P(INDEX_HTML_PART2);
   delay(1);
   server.sendContent_P(INDEX_HTML_END);
@@ -1510,21 +2754,8 @@ static void sendIndex() {
   server.client().stop();
 }
 
-// ============================================================================
-// Routes
-// ============================================================================
-
 void routes() {
-  server.on("/", HTTP_GET, sendIndex);
-  server.on("/api/status", HTTP_GET, handleApiStatus);
-  server.on("/api/tasks", HTTP_GET, sendTaskMonitoring);
-  server.on("/api/network", HTTP_POST, hNetworkConfig);
-  server.on("/api/exec", HTTP_POST, hExec);
-  server.on("/api/biz/start", HTTP_POST, hBizStart);
-  server.on("/api/biz/stop", HTTP_POST, hBizStop);
-  server.onNotFound([]() {
-    server.send(404, "application/json", "{\"err\":\"not found\"}");
-  });
+  register_guarded_routes();
 
   if (WiFi.getMode() == WIFI_OFF) {
     WiFi.mode(WIFI_STA);
@@ -1534,20 +2765,31 @@ void routes() {
 }
 
 // ============================================================================
-// RTOS Tasks
+// RTOS Tasks - WITH GRACEFUL SELF-DELETION AND OTA PROTECTION
 // ============================================================================
 void systemTask(void* param) {
   esp_task_wdt_add(NULL);
   bool ledState = false;
   uint32_t ledTs = 0;
   pinMode(BLE_LED_PIN, OUTPUT);
-  
-  // Set initial state based on LED polarity
+
   digitalWrite(BLE_LED_PIN, LED_INVERTED ? HIGH : LOW);
 
   for (;;) {
     esp_task_wdt_reset();
-    checkWiFiConnection();
+
+    #if ENABLE_OTA
+    // Minimal operation during OTA - don't touch WiFi
+    if (otaInProgress) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    #endif
+
+    if (!isOtaActive()) {
+      checkWiFiConnection();
+    }
+
     handleBLEReconnect();
     updateCpuLoad();
     checkTaskStacks();
@@ -1570,10 +2812,29 @@ void systemTask(void* param) {
 
 void webTask(void* param) {
   esp_task_wdt_add(NULL);
+  
   for (;;) {
+    // Check if we should exit (for OTA)
+    #if ENABLE_OTA
+    if (webTaskShouldExit) {
+      Serial.println(F("webTask: Received exit signal, cleaning up..."));
+      esp_task_wdt_delete(NULL); // Remove from watchdog BEFORE deletion
+      webTaskHandle = NULL; // Clear handle
+      Serial.println(F("webTask: Exiting"));
+      vTaskDelete(NULL); // Delete self
+      return;
+    }
+    #endif
+    
     esp_task_wdt_reset();
     server.handleClient();
-    updateTaskMonitoring();
+
+    if (!isOtaActive()) {
+      updateTaskMonitoring();
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
@@ -1583,8 +2844,21 @@ void bizTask(void* param) {
   ExecMessage* msg = nullptr;
 
   for (;;) {
+    // Check if we should exit (for OTA)
+    #if ENABLE_OTA
+    if (bizTaskShouldExit) {
+      Serial.println(F("bizTask: Received exit signal, cleaning up..."));
+      esp_task_wdt_delete(NULL); // Remove from watchdog BEFORE deletion
+      bizTaskHandle = NULL; // Clear handle
+      Serial.println(F("bizTask: Exiting"));
+      vTaskDelete(NULL); // Delete self
+      return;
+    }
+    #endif
+    
     esp_task_wdt_reset();
-    if (gBizState == BIZ_RUNNING) {
+
+    if (gBizState == BIZ_RUNNING && !isOtaActive()) {
       if (execQ && xQueueReceive(execQ, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (msg) {
           vTaskDelay(pdMS_TO_TICKS(50));
@@ -1605,13 +2879,12 @@ void bizTask(void* param) {
 
 void setup() {
   delay(300);
+  Serial.begin(115200);
 
-  // Suppress verbose ESP logs
   esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_log_level_set("dhcpc", ESP_LOG_WARN);
   esp_log_level_set("phy_init", ESP_LOG_WARN);
 
-  // Configure watchdog
   esp_task_wdt_deinit();
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = WDT_TIMEOUT * 1000,
@@ -1620,11 +2893,9 @@ void setup() {
   };
   esp_task_wdt_init(&wdt_config);
 
-  // Initialize NVS and load config
   prefs.begin("esp32_base", false);
   loadNetworkConfig();
 
-  // Initialize temperature sensor if available
 #if ESP32_HAS_TEMP
   temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
   if (temperature_sensor_install(&cfg, &s_temp_sensor) == ESP_OK) {
@@ -1639,7 +2910,6 @@ void setup() {
 
   execQ = xQueueCreate(MSG_POOL_SIZE, sizeof(ExecMessage*));
 
-  // Initialize per-core runtime structures
   for (int c = 0; c < NUM_CORES; c++) {
     coreRuntime[c].totalRuntime100ms = 0;
     coreRuntime[c].prevTotalRuntime100ms = 0;
@@ -1647,7 +2917,6 @@ void setup() {
     coreRuntime[c].cpuPercentTotal = 0;
   }
 
-  // Create RTOS tasks
 #if NUM_CORES > 1
   xTaskCreatePinnedToCore(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle, 1);
   xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, &webTaskHandle, 0);
