@@ -434,10 +434,16 @@
       try {
         addLog('Requesting Bluetooth device...');
         
-        device = await navigator.bluetooth.requestDevice({
-          acceptAllDevices: true,
-          optionalServices: []
-        });
+device = await navigator.bluetooth.requestDevice({
+  acceptAllDevices: true,
+  optionalServices: [
+    '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+    '0000ffe0-0000-1000-8000-00805f9b34fb',
+    '4fafc201-1fb5-459e-8fcc-c5c9c331914b',
+    'generic_access',
+    'device_information'
+  ]
+});
 
         addLog('Found device: ' + (device.name || 'Unknown Device'), 'success');
         
