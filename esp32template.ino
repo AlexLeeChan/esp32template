@@ -243,13 +243,13 @@ struct MemoryInfo {
 };
 
 #if ENABLE_OTA
-// OTA Update state
 enum OTAState : uint8_t {
   OTA_IDLE = 0,
   OTA_CHECKING,
   OTA_DOWNLOADING,
-  OTA_SUCCESS,
-  OTA_FAILED
+  OTA_FLASHING,  // <-- NEW STATE (value 3)
+  OTA_SUCCESS,   // <-- is now 4
+  OTA_FAILED     // <-- is now 5
 };
 
 struct OTAStatus {
@@ -311,6 +311,7 @@ static inline void sendBusyJson(WebServer& s, const char* msg = "OTA in progress
 }
 
 // A tiny HTML page for "/" during OTA (prevents big PROGMEM streaming)
+// A tiny HTML page for "/" during OTA (prevents big PROGMEM streaming)
 static const char OTA_BUSY_HTML[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -345,33 +346,37 @@ async function poll(){
    const j = await r.json();
    if(!j) { setTimeout(poll, 1500); return; }
 
-   if(j.state===0 || j.state===3 || j.state===4){ location.reload(); return; }
+   // --- MODIFIED: States 4 (Success) and 5 (Failed) are now exit states ---
+   if(j.state===0 || j.state===4 || j.state===5){ location.reload(); return; }
 
    if(j.state===1) {
-    title.textContent = 'Checking...';
-    status.textContent = 'Checking for firmware update...';
-    prog.textContent = '...';
-    fill.style.width = '1%';
+     title.textContent = 'Checking...';
+     status.textContent = 'Checking for firmware update...';
+     prog.textContent = '...';
+     fill.style.width = '1%';
    } else if (j.state===2) {
-    title.textContent = 'Downloading...';
-    status.textContent = 'Downloading new firmware. Do not unplug.';
-    const p = j.progress || 0;
-    fill.style.width = p + '%';
-    
-    let pText = p + '%';
-    if (j.file_size > 0) {
-     const downloaded = fmB((j.file_size * p) / 100);
-     const total = fmB(j.file_size);
-     pText = `${p}% (${downloaded} / ${total})`;
-    }
-    
-    if (p >= 99) {
+     title.textContent = 'Downloading...';
+     status.textContent = 'Downloading new firmware. Do not unplug.';
+     const p = j.progress || 0;
+     fill.style.width = p + '%';
+     
+     let pText = p + '%';
+     if (j.file_size > 0) {
+       const downloaded = fmB((j.file_size * p) / 100);
+       const total = fmB(j.file_size);
+       pText = `${p}% (${downloaded} / ${total})`;
+     }
+     
+     prog.textContent = pText;
+     
+   // --- NEW: Handle Flashing state (3) ---
+   } else if (j.state===3) {
      title.textContent = 'Flashing...';
      status.textContent = 'Download complete. Writing to flash...';
      prog.textContent = 'This may take a minute. Device will reboot.';
-    } else {
-     prog.textContent = pText;
-    }
+     fill.style.width = '100%';
+     // Server will die, so we stop polling.
+     return;
    }
   }catch(e){
    prog.textContent = 'Connection lost. Retrying...';
@@ -470,16 +475,22 @@ static void handleOTAStatus() {
     doc["error"] = otaStatus.error;
     doc["file_size"] = otaStatus.fileSize;
 
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    if (running) {
-      doc["current_partition"] = running->label;
-    }
+    // --- FIX FOR RACE CONDITION ---
+    // Only call esp_ota functions when the OTA task is IDLE or FAILED.
+    // The ota_task has exclusive access to partitions during CHECKING, DOWNLOADING, and SUCCESS states.
+    if (otaStatus.state == OTA_IDLE || otaStatus.state == OTA_FAILED) {
+      const esp_partition_t* running = esp_ota_get_running_partition();
+      if (running) {
+        doc["current_partition"] = running->label;
+      }
 
-    const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
-    if (next) {
-      doc["next_partition"] = next->label;
-      doc["partition_size"] = next->size;
+      const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
+      if (next) {
+        doc["next_partition"] = next->label;
+        doc["partition_size"] = next->size;
+      }
     }
+    // --- END FIX ---
 
     xSemaphoreGive(otaMutex);
   }
@@ -501,68 +512,70 @@ static void handleOTAInfo() {
 }
 
 // Signal tasks to exit gracefully and wait for them
+// Signal tasks to exit gracefully and wait for them
 static void deleteNonEssentialTasks() {
   if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    if (tasksDeleted) {
-      xSemaphoreGive(taskDeletionMutex);
-      return;
-    }
     
-    Serial.println(F("\n=== Stopping Non-Essential Tasks for OTA ==="));
-    
-    // Stop business logic first
-    gBizState = BIZ_STOPPED;
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Signal tasks to exit gracefully
-    webTaskShouldExit = true;
-    bizTaskShouldExit = true;
-    
-    Serial.println(F("Signaling tasks to exit gracefully..."));
-    
-    // Wait for tasks to clean up themselves (max 2 seconds)
-    uint8_t waitCount = 0;
-    while ((webTaskHandle != NULL || bizTaskHandle != NULL) && waitCount < 40) {
-      vTaskDelay(pdMS_TO_TICKS(50));
-      waitCount++;
-    }
-    
-    // Check if tasks exited gracefully
-    if (webTaskHandle != NULL) {
-      Serial.println(F("Warning: webTask didn't exit gracefully, force deleting..."));
-      vTaskDelete(webTaskHandle);
-      webTaskHandle = NULL;
-    } else {
-      Serial.println(F("✓ webTask exited gracefully"));
-    }
-    
+    // --- MODIFIED: This function now ONLY stops bizTask ---
     if (bizTaskHandle != NULL) {
-      Serial.println(F("Warning: bizTask didn't exit gracefully, force deleting..."));
-      vTaskDelete(bizTaskHandle);
-      bizTaskHandle = NULL;
-    } else {
-      Serial.println(F("✓ bizTask exited gracefully"));
+      Serial.println(F("\n=== Stopping bizTask for OTA ==="));
+      gBizState = BIZ_STOPPED;
+      vTaskDelay(pdMS_TO_TICKS(100));
+      bizTaskShouldExit = true;
+
+      uint8_t waitCount = 0;
+      while (bizTaskHandle != NULL && waitCount < 20) { // 1 sec wait
+        vTaskDelay(pdMS_TO_TICKS(50));
+        waitCount++;
+      }
+
+      if (bizTaskHandle != NULL) {
+        Serial.println(F("Warning: bizTask didn't exit gracefully, force deleting..."));
+        vTaskDelete(bizTaskHandle);
+        bizTaskHandle = NULL;
+      } else {
+        Serial.println(F("✓ bizTask exited gracefully"));
+      }
+      Serial.println(F("=== bizTask Deletion Complete ===\n"));
     }
     
-    tasksDeleted = true;
+    tasksDeleted = true; // We use this flag to know bizTask needs recreating
     xSemaphoreGive(taskDeletionMutex);
-    
-    // Give idle task time to clean up
-    Serial.println(F("Waiting for cleanup..."));
-    vTaskDelay(pdMS_TO_TICKS(300));
-    
-    Serial.printf("Post-deletion Free Heap: %u bytes\n", ESP.getFreeHeap());
-    Serial.println(F("=== Task Deletion Complete ===\n"));
   }
 }
+// --- NEW FUNCTION ---
+// This is called AFTER download, just before flashing
+static void deleteWebTask() {
+  if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (webTaskHandle != NULL) {
+      Serial.println(F("\n=== Stopping webTask for OTA Flash ==="));
+      webTaskShouldExit = true;
 
+      uint8_t waitCount = 0;
+      while (webTaskHandle != NULL && waitCount < 20) { // 1 sec wait
+        vTaskDelay(pdMS_TO_TICKS(50));
+        waitCount++;
+      }
+
+      if (webTaskHandle != NULL) {
+        Serial.println(F("Warning: webTask didn't exit gracefully, force deleting..."));
+        vTaskDelete(webTaskHandle);
+        webTaskHandle = NULL;
+      } else {
+        Serial.println(F("✓ webTask exited gracefully"));
+      }
+      Serial.println(F("=== webTask Deletion Complete ===\n"));
+    }
+    xSemaphoreGive(taskDeletionMutex);
+  }
+}
+// Recreate tasks after OTA failure
 // Recreate tasks after OTA failure
 static void recreateTasks() {
   if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    if (!tasksDeleted) {
-      xSemaphoreGive(taskDeletionMutex);
-      return;
-    }
+    
+    // --- MODIFIED: No longer checks 'tasksDeleted' flag ---
+    // Instead, it just recreates any task that is missing.
     
     Serial.println(F("\n=== Recreating Tasks After OTA Failure ==="));
     
@@ -599,7 +612,8 @@ static void recreateTasks() {
         Serial.println(F("✗ FAILED to create webTask!"));
       }
     }
-    
+
+    // Reset this flag (in case it was set by deleteNonEssentialTasks)
     tasksDeleted = false;
     xSemaphoreGive(taskDeletionMutex);
     
@@ -675,7 +689,7 @@ static void handleOTAUpdate() {
       delete urlPtr;
       
       Serial.println(F("\n╔════════════════════════════════════════╗"));
-      Serial.println(F("║       OTA UPDATE STARTED               ║"));
+      Serial.println(F("║     OTA UPDATE STARTED             ║"));
       Serial.println(F("╚════════════════════════════════════════╝"));
       Serial.printf("URL: %s\n", url.c_str());
       Serial.printf("Free Heap: %u bytes\n\n", ESP.getFreeHeap());
@@ -683,10 +697,22 @@ static void handleOTAUpdate() {
       vTaskDelay(pdMS_TO_TICKS(300));
       esp_task_wdt_reset();
       
-      deleteNonEssentialTasks();
+      // --- MODIFIED: webTask is ALIVE, so keep routes active ---
+      server.on("/api/ota/status", HTTP_GET, handleOTAStatus);
+      server.on("/api/ota/reset", HTTP_POST, handleOTAReset);
+      server.on("/api/ota/update", HTTP_POST, handleOTAUpdate);
+
+      // --- MODIFIED: Only kills bizTask ---
+      deleteNonEssentialTasks(); 
       esp_task_wdt_reset();
+
+      #if ESP32_HAS_BLE
+        Serial.println(F("Stopping BLE to free heap..."));
+        NimBLEDevice::deinit();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        Serial.printf("Heap after BLE deinit: %u bytes\n", ESP.getFreeHeap());
+      #endif
       
-      // CRITICAL: Set flag to prevent WiFi management interference
       otaInProgress = true;
       Serial.println(F("OTA in progress flag set - WiFi management disabled"));
       
@@ -699,7 +725,6 @@ static void handleOTAUpdate() {
       esp_wifi_set_ps(WIFI_PS_NONE);
       Serial.println(F("WiFi power save disabled"));
       
-      // Let WiFi stabilize
       vTaskDelay(pdMS_TO_TICKS(200));
       esp_task_wdt_reset();
       
@@ -709,7 +734,6 @@ static void handleOTAUpdate() {
       
       bool isSecure = url.startsWith("https://");
       
-      // ALWAYS configure both clients upfront
       clientSecure.setInsecure();
       clientSecure.setTimeout(30);
       client.setTimeout(30);
@@ -723,7 +747,7 @@ static void handleOTAUpdate() {
       }
       
       httpClient.setUserAgent(F("ESP32-OTA/1.0"));
-      httpClient.setTimeout(30000);
+      httpClient.setTimeout(15000); 
       httpClient.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
       httpClient.setReuse(false);
       
@@ -732,57 +756,52 @@ static void handleOTAUpdate() {
       Serial.println(F("Sending HTTP GET request..."));
       int httpCode = httpClient.GET();
       
-// Handle redirects manually
-if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND || 
-    httpCode == HTTP_CODE_SEE_OTHER || httpCode == HTTP_CODE_TEMPORARY_REDIRECT) {
-  
-  String newLocation = httpClient.getLocation();
-  Serial.printf("Redirect %d to: %s\n", httpCode, newLocation.c_str());
-  
-  httpClient.end();
-  
-  // CRITICAL: Stop the previous client connection explicitly
-  if (isSecure) {
-    clientSecure.stop();
-    Serial.println(F("Stopped secure client"));
-  } else {
-    client.stop();
-    Serial.println(F("Stopped regular client"));
-  }
-  
-  // Give time for proper cleanup
-  vTaskDelay(pdMS_TO_TICKS(300));
-  esp_task_wdt_reset();
-  
-  bool newIsSecure = newLocation.startsWith("https://");
-  
-  // Reinitialize with the new URL and appropriate client
-  if (newIsSecure) {
-    Serial.println(F("Following redirect with HTTPS..."));
-    // Ensure secure client is ready
-    clientSecure.setInsecure();
-    clientSecure.setTimeout(30);
-    httpClient.begin(clientSecure, newLocation);
-  } else {
-    Serial.println(F("Following redirect with HTTP..."));
-    client.setTimeout(30);
-    httpClient.begin(client, newLocation);
-  }
-  
-  isSecure = newIsSecure;
-  httpClient.setUserAgent(F("ESP32-OTA/1.0"));
-  httpClient.setTimeout(30000);
-  httpClient.setReuse(false);
-  
-  // Give connection time to establish
-  vTaskDelay(pdMS_TO_TICKS(100));
-  esp_task_wdt_reset();
-  
-  Serial.println(F("Sending redirected GET request..."));
-  httpCode = httpClient.GET();
-  
-  Serial.printf("After redirect, HTTP code: %d\n", httpCode);
-}
+      // Handle redirects manually
+      if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND || 
+          httpCode == HTTP_CODE_SEE_OTHER || httpCode == HTTP_CODE_TEMPORARY_REDIRECT) {
+        
+        String newLocation = httpClient.getLocation();
+        Serial.printf("Redirect %d to: %s\n", httpCode, newLocation.c_str());
+        
+        httpClient.end();
+        
+        if (isSecure) {
+          clientSecure.stop();
+          Serial.println(F("Stopped secure client"));
+        } else {
+          client.stop();
+          Serial.println(F("Stopped regular client"));
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(300));
+        esp_task_wdt_reset();
+        
+        bool newIsSecure = newLocation.startsWith("https://");
+        
+        if (newIsSecure) {
+          Serial.println(F("Following redirect with HTTPS..."));
+          clientSecure.setInsecure();
+          clientSecure.setTimeout(30);
+          httpClient.begin(clientSecure, newLocation);
+        } else {
+          Serial.println(F("Following redirect with HTTP..."));
+          client.setTimeout(30);
+          httpClient.begin(client, newLocation);
+        }
+        
+        isSecure = newIsSecure;
+        httpClient.setUserAgent(F("ESP32-OTA/1.0"));
+        httpClient.setTimeout(15000); 
+        httpClient.setReuse(false);
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_task_wdt_reset();
+        
+        Serial.println(F("Sending redirected GET request..."));
+        httpCode = httpClient.GET();
+        
+        Serial.printf("After redirect, HTTP code: %d\n", httpCode);
+      }
       
       if (httpCode != HTTP_CODE_OK) {
         char errStr[160];
@@ -805,7 +824,7 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
         httpClient.end();
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_task_wdt_delete(NULL);
-        recreateTasks();
+        recreateTasks(); // This will recreate bizTask
         vTaskDelete(NULL);
         return;
       }
@@ -824,13 +843,13 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
         httpClient.end();
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_task_wdt_delete(NULL);
-        recreateTasks();
+        recreateTasks(); // This will recreate bizTask
         vTaskDelete(NULL);
         return;
       }
       
       Serial.printf("✓ HTTP OK - Content-Length: %d bytes (%.2f MB)\n", 
-                    contentLength, contentLength / 1048576.0);
+                   contentLength, contentLength / 1048576.0);
       
       if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         otaStatus.fileSize = contentLength;
@@ -853,7 +872,7 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
         httpClient.end();
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_task_wdt_delete(NULL);
-        recreateTasks();
+        recreateTasks(); // This will recreate bizTask
         vTaskDelete(NULL);
         return;
       }
@@ -875,13 +894,13 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
         httpClient.end();
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_task_wdt_delete(NULL);
-        recreateTasks();
+        recreateTasks(); // This will recreate bizTask
         vTaskDelete(NULL);
         return;
       }
       
       Serial.printf("✓ Target partition: %s (%.2f MB)\n", 
-                    update_partition->label, update_partition->size / 1048576.0);
+                   update_partition->label, update_partition->size / 1048576.0);
       
       Update.abort();
       vTaskDelay(pdMS_TO_TICKS(100));
@@ -904,12 +923,13 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
         httpClient.end();
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_task_wdt_delete(NULL);
-        recreateTasks();
+        recreateTasks(); // This will recreate bizTask
         vTaskDelete(NULL);
         return;
       }
       
       Serial.println(F("✓ Update.begin() successful!"));
+      esp_task_wdt_reset(); 
       Serial.println(F("\n--- Starting Download & Flash ---"));
       
       esp_task_wdt_reset();
@@ -923,7 +943,6 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
       uint8_t buff[1024];
       
       while (written < contentLength) {
-        // Reset watchdog every 5 seconds
         if (millis() - lastWdtReset > 5000) {
           esp_task_wdt_reset();
           lastWdtReset = millis();
@@ -943,7 +962,7 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
           httpClient.end();
           esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
           esp_task_wdt_delete(NULL);
-          recreateTasks();
+          recreateTasks(); // This will recreate bizTask
           vTaskDelete(NULL);
           return;
         }
@@ -971,7 +990,7 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
               httpClient.end();
               esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
               esp_task_wdt_delete(NULL);
-              recreateTasks();
+              recreateTasks(); // This will recreate bizTask
               vTaskDelete(NULL);
               return;
             }
@@ -1002,9 +1021,26 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
       httpClient.end();
       
       Serial.printf("\n✓ Download complete! %u bytes written\n", written);
-      Serial.println(F("Finalizing update..."));
       
+      // --- NEW LOGIC: Set Flashing state, kill webTask, then flash ---
+      
+      Serial.println(F("Setting state to FLASHING"));
+      if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        otaStatus.state = OTA_FLASHING; // Set new state
+        otaStatus.progress = 100;
+        xSemaphoreGive(otaMutex);
+      }
+      
+      // Give the web UI 2 seconds to poll one last time and see the "Flashing" message
+      Serial.println(F("Waiting 2s for UI to update..."));
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      
+      // Now, kill the webTask to prevent race condition
+      deleteWebTask();
+      vTaskDelay(pdMS_TO_TICKS(200)); // Short delay for cleanup
       esp_task_wdt_reset();
+      
+      Serial.println(F("Finalizing update..."));
       
       if (!Update.end(true)) {
         char errStr[128];
@@ -1020,7 +1056,7 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
         otaInProgress = false;
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_task_wdt_delete(NULL);
-        recreateTasks();
+        recreateTasks(); // This will recreate BOTH tasks
         vTaskDelete(NULL);
         return;
       }
@@ -1037,13 +1073,13 @@ if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
         otaInProgress = false;
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_task_wdt_delete(NULL);
-        recreateTasks();
+        recreateTasks(); // This will recreate BOTH tasks
         vTaskDelete(NULL);
         return;
       }
       
       Serial.println(F("\n╔════════════════════════════════════════╗"));
-      Serial.println(F("║      OTA UPDATE SUCCESS!               ║"));
+      Serial.println(F("║     OTA UPDATE SUCCESS!            ║"));
       Serial.println(F("╚════════════════════════════════════════╝"));
       Serial.println(F("Rebooting in 2 seconds...\n"));
       
@@ -1676,23 +1712,34 @@ void checkWiFiConnection() {
     case WIFI_STATE_CONNECTING:
       if (status == WL_CONNECTED) {
         wifiState = WIFI_STATE_CONNECTED;
-        wifiReconnectAttempts = 0;
+        wifiReconnectAttempts = 0;  // ✅ Reset on successful connection
+        wifiLastConnectAttempt = now;  // ✅ Update timestamp
       } else if (now - wifiLastConnectAttempt > WIFI_CONNECT_TIMEOUT) {
         wifiState = WIFI_STATE_DISCONNECTED;
+        wifiLastConnectAttempt = now;  // ✅ Update for backoff calculation
       }
       break;
 
     case WIFI_STATE_CONNECTED:
       if (status != WL_CONNECTED) {
         wifiState = WIFI_STATE_DISCONNECTED;
+        wifiLastConnectAttempt = now;  // ✅ Update when disconnecting
+      } else {
+        // ✅ NEW: Reset reconnect attempts after sustained connection (5 minutes)
+        if (wifiReconnectAttempts > 0 && (now - wifiLastConnectAttempt > 300000)) {
+          wifiReconnectAttempts = 0;
+        }
       }
       break;
 
     case WIFI_STATE_DISCONNECTED:
-      uint8_t maxShift = min(wifiReconnectAttempts, (uint8_t)4);
-      uint32_t backoffDelay = WIFI_RECONNECT_DELAY * (1 << maxShift);
-      if (now - wifiLastConnectAttempt > backoffDelay) {
-        wifiState = WIFI_STATE_IDLE;
+      {
+        uint8_t maxShift = min(wifiReconnectAttempts, (uint8_t)4);
+        uint32_t backoffDelay = WIFI_RECONNECT_DELAY * (1 << maxShift);
+        if (now - wifiLastConnectAttempt > backoffDelay) {
+          wifiState = WIFI_STATE_IDLE;
+          // wifiLastConnectAttempt will be updated when entering CONNECTING state
+        }
       }
       break;
   }
@@ -2073,21 +2120,20 @@ void hExec() {
   String cmdStr = doc["cmd"] | "";
   cmdStr.trim();
 
-  if (cmdStr.equalsIgnoreCase("reset")) {
-    server.send(200, "application/json", "{\"msg\":\"Rebooting...\"}");
-    delay(100);
-    ESP.restart();
-    return;
-  }
+  // --- DEBUG ---
+  Serial.printf("\n[hExec] Received command: '%s'\n", cmdStr.c_str());
+  // --- END DEBUG ---
 
   size_t cmdLen = cmdStr.length();
   if (cmdLen == 0 || cmdLen >= MAX_MSG_SIZE) {
+    Serial.println("[hExec] Command is empty or too long. Aborting.");
     server.send(400, "application/json", "{\"err\":\"invalid cmd\"}");
     return;
   }
 
   ExecMessage* msg = allocMessage();
   if (!msg) {
+    Serial.println("[hExec] Message pool is full. Aborting.");
     server.send(503, "application/json", "{\"err\":\"pool full\"}");
     return;
   }
@@ -2097,8 +2143,22 @@ void hExec() {
   msg->length = cmdLen;
 
   if (execQ && xQueueSend(execQ, &msg, 0) == pdTRUE) {
-    server.send(200, "application/json", "{\"msg\":\"queued\"}");
+    // --- DEBUG ---
+    Serial.printf("[hExec] Command '%s' successfully sent to bizTask queue.\n", msg->payload);
+    // --- END DEBUG ---
+    
+    // Give a specific response if a reboot command is queued
+    String lowerCmd = cmdStr;
+    lowerCmd.toLowerCase();
+    if (lowerCmd.equals("reset") || lowerCmd.equals("reboot")) {
+      server.send(200, "application/json", "{\"msg\":\"Reboot command queued\"}");
+    } else {
+      server.send(200, "application/json", "{\"msg\":\"queued\"}");
+    }
   } else {
+    // --- DEBUG ---
+    Serial.println("[hExec] FAILED to send command to bizTask queue.");
+    // --- END DEBUG ---
     freeMessage(msg);
     server.send(503, "application/json", "{\"err\":\"queue send failed\"}");
   }
@@ -2256,7 +2316,7 @@ static const char INDEX_HTML_CMD_CARD[] PROGMEM = R"rawliteral(
  <div class="form-group">
   <input type="text" id="execCmd" placeholder="Enter command...">
  </div>
- <button class="btn primary" onclick="execCommand()">Execute</button>
+ <button class="btn primary" onclick="submitCommand()">Execute</button> <div id="execResult"></div>
  <div id="execResult"></div>
 </div>
 )rawliteral";
@@ -2318,34 +2378,23 @@ static const char INDEX_HTML_TASKS[] PROGMEM = R"rawliteral(
 static const char INDEX_HTML_OTA[] PROGMEM = R"rawliteral(
 <div class="card condensed">
  <h3>OTA Firmware Update</h3>
- <div id="otaStatus" class="alert info">Status: <span id="otaState">Checking...</span></div>
  <div id="otaAvailable" style="display:none">
   <div class="form-group">
    <label>Firmware URL</label>
    <input type="text" id="otaUrl" placeholder="http://example.com/firmware.bin">
   </div>
-    <div class="row" style="font-size: 0.9em; gap: 8px;">
-    <style>#otaAvailable .pill strong { color: #58a6ff; }</style>
-    <div class="pill">Running: <strong id="currentPartition">-</strong></div>
-    <div class="pill">Target: <strong id="targetPartition" style="color:#d29922">-</strong></div>
-    <div class="pill">Target Size: <strong id="targetSize">-</strong></div>
-    <div class="pill">Free Space: <strong id="freeSpace">-</strong></div>
-    <div class="pill">Current Sketch: <strong id="sketchSize">-</strong></div>
-  </div>
-    <div id="otaProgress" style="display:none;margin-bottom:6px">
-   <div class="progress-bar" style="height:12px">
-    <div class="progress-fill" id="otaProgressBar" style="width:0%"></div>
-   </div>
-   <p style="text-align:center;margin-top:4px;font-size:0.8em"><span id="otaProgressText">0</span>%</p>
+   <div class="row" style="font-size: 0.9em; gap: 8px;">
+     <style>#otaAvailable .pill strong { color: #58a6ff; }</style>
+     <div class="pill">Free Space for OTA: <strong id="freeSpace">-</strong></div>
   </div>
   <div class="row">
    <button class="btn primary" id="otaUpdateBtn" onclick="startOTAUpdate()">Start Update</button>
-   <button class="btn secondary" id="otaResetBtn" onclick="resetOTA()" style="display:none">Reset</button>
   </div>
  </div>
  <div id="otaNotAvailable" style="display:none">
-  <p style="color:#f85149;font-size:0.9em;">OTA updates are not available.</p>
+   <p style="color:#f85149;font-size:0.9em;">OTA updates are not available (no 'ota' partition found).</p>
  </div>
+ <div id="otaUpdateResult" style="margin-top: 8px;"></div>
 </div>
 )rawliteral";
 #endif
@@ -2357,110 +2406,66 @@ const I=id=>document.getElementById(id);
 let otaInterval = null;
 
 async function refreshOTA(){
-const j=await api('/api/ota/status');
-if(j.error)return;
+ const j = await api('/api/ota/status');
+ if(j.error) return;
 
-const otaAvail=document.getElementById('otaAvailable');
-const otaNotAvail=document.getElementById('otaNotAvailable');
-const otaStateEl=I('otaState');
-const otaStatusEl=document.getElementById('otaStatus');
-const otaProgressDiv=document.getElementById('otaProgress');
-const otaUpdateBtn=document.getElementById('otaUpdateBtn');
-const otaResetBtn=document.getElementById('otaResetBtn');
+ const otaAvail = document.getElementById('otaAvailable');
+ const otaNotAvail = document.getElementById('otaNotAvailable');
 
-if(!j.available){
- if(otaAvail)otaAvail.style.display='none';
- if(otaNotAvail)otaNotAvail.style.display='block';
- otaStateEl.textContent='Not Available';
- return;
-}
+ if(!j.available){
+   if(otaAvail) otaAvail.style.display = 'none';
+   if(otaNotAvail) otaNotAvail.style.display = 'block';
+   return;
+ }
 
-if(otaAvail)otaAvail.style.display='block';
-if(otaNotAvail)otaNotAvail.style.display='none';
-
-const states=['Idle','Checking','Downloading','Success','Failed'];
-otaStateEl.textContent=states[j.state]||'Unknown';
-
-if(j.state===0){
- otaStatusEl.className='alert info';
- if(otaProgressDiv)otaProgressDiv.style.display='none';
- if(otaUpdateBtn)otaUpdateBtn.disabled=false;
- if(otaResetBtn)otaResetBtn.style.display='none';
-}else if(j.state===1||j.state===2){
- otaStatusEl.className='alert info';
- if(otaProgressDiv)otaProgressDiv.style.display='block';
- I('otaProgressBar').style.width=j.progress+'%';
+ if(otaAvail) otaAvail.style.display = 'block';
+ if(otaNotAvail) otaNotAvail.style.display = 'none';
  
-   let progressText = j.progress;
-   if (j.file_size > 0) {
-       const downloaded = fmB((j.file_size * j.progress) / 100);
-       const total = fmB(j.file_size);
-       progressText = `${j.progress}% (${downloaded} / ${total})`;
-   } else {
-       progressText = `${j.progress}%`;
-   }
-   I('otaProgressText').textContent = progressText;
-
- if(otaUpdateBtn)otaUpdateBtn.disabled=true;
- if(otaResetBtn)otaResetBtn.style.display='none';
-}else if(j.state===3){
- otaStatusEl.className='alert success';
- otaStateEl.textContent='Success - Rebooting...';
- if(otaProgressDiv)otaProgressDiv.style.display='block';
- I('otaProgressBar').style.width='100%';
- I('otaProgressText').textContent='100%';
- if(otaUpdateBtn)otaUpdateBtn.disabled=true;
- if(otaResetBtn)otaResetBtn.style.display='none';
-}else if(j.state===4){
- otaStatusEl.className='alert error';
- otaStateEl.textContent='Failed: '+j.error;
- if(otaProgressDiv)otaProgressDiv.style.display='none';
- if(otaUpdateBtn)otaUpdateBtn.disabled=false;
- if(otaResetBtn)otaResetBtn.style.display='inline-block';
-}
-
-if(j.current_partition)I('currentPartition').textContent=j.current_partition;
-if(j.next_partition)I('targetPartition').textContent=j.next_partition;
-if(j.partition_size)I('targetSize').textContent=fmB(j.partition_size);
-if(j.sketch_size)I('sketchSize').textContent=fmB(j.sketch_size);
-if(j.free_sketch_space)I('freeSpace').textContent=fmB(j.free_sketch_space);
+ if(j.free_sketch_space) I('freeSpace').textContent = fmB(j.free_sketch_space);
+ 
+ // We no longer care about states, so the rest of the function is gone.
 }
 
 async function startOTAUpdate(){
- const url=I('otaUrl').value.trim();
- if(!url){alert('Enter firmware URL');return;}
- if(!url.startsWith('http')){alert('URL must start with http:// or https://');return;}
- if(!confirm('Start OTA update? Device will reboot after successful update.')){return;}
+ const url = I('otaUrl').value.trim();
+ if(!url){ alert('Enter firmware URL'); return; }
+ if(!url.startsWith('http')){ alert('URL must start with http:// or https://'); return; }
+ if(!confirm('Start OTA update? The device will reboot after a successful update. The web page will become unavailable during the update.')){ return; }
  
- const r=await api('/api/ota/update','POST',{url});
+ const res = I('otaUpdateResult');
+ const r = await api('/api/ota/update','POST',{url});
  
- if(r.error||r.err){
-   alert('Error: '+(r.error||r.err));
-   refreshOTA();
- }
- else{
-   // Redirect to OTA monitoring page after 1 second
-   setTimeout(() => {
-     location.reload(); // This will load the OTA_BUSY_HTML page
-   }, 1000);
+ if(r.error || r.err){
+    const msg = (r.error || r.err);
+    if (msg !== 'ota_active') { // Don't show alert if it's just busy
+      alert('Error: ' + msg);
+    }
+    if(res) res.innerHTML = `<div class="alert error">Error: ${msg}</div>`;
+ } else {
+    if(res) res.innerHTML = `<div class="alert success">Update started! This page will disconnect. Device will reboot on success.</div>`;
+    // We don't reload, we just let the connection die as the ota_task kills the webTask
  }
 }
 
 async function resetOTA(){
- const r=await api('/api/ota/reset','POST');
- if(!r.error){refreshOTA();}
+ // This function is no longer used
 }
+
 async function api(path,method='GET',body=null){
- try{
-  const opts={method};
-  if(body){opts.headers={'Content-Type':'application/json'};opts.body=JSON.stringify(body);}
-  const r=await fetch(path,opts);
-  if(r.status === 503) {
-    console.warn('Server is busy (OTA in progress).');
-    return { error: 'ota_active' };
-  }
-  return await r.json();
- }catch(e){return{error:e.message}}
+try{
+ const opts={method};
+ if(body){opts.headers={'Content-Type':'application/json'};opts.body=JSON.stringify(body);}
+ const r=await fetch(path,opts);
+ if(r.status === 503) {
+  console.warn('Server is busy (OTA in progress).');
+  return { error: 'ota_active' };
+ }
+  if(!r.ok) {
+     const errText = await r.text();
+     return {error: `HTTP ${r.status}: ${errText}`};
+   }
+ return await r.json();
+}catch(e){return{error:e.message}}
 }
 function fmU(ms){const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;return`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`}
 function fmB(b){if(b<1024)return`${b}B`;if(b<1048576)return`${(b/1024).toFixed(1)}KB`;return`${(b/1048576).toFixed(2)}MB`;}
@@ -2471,114 +2476,130 @@ function coreCls(c){if(c==='ANY')return'core-any';if(c==='0')return'core-0';if(c
 I('wifiDhcp').addEventListener('change',()=>{I('staticIpFields').style.display=I('wifiDhcp').checked?'none':'block';});
 async function startBiz(){const r=await api('/api/biz/start','POST');if(r.error)return;if(!r.error){I('bizState').textContent='RUNNING';refresh();}}
 async function stopBiz(){const r=await api('/api/biz/stop','POST');if(r.error)return;if(!r.error){I('bizState').textContent='STOPPED';refresh();}}
-async function execCommand(){
- const cmd=I('execCmd').value.trim();
- if(!cmd){alert('Enter a command');return;}
- const r=await api('/api/exec','POST',{cmd});
- if(r.error)return;
- const res=I('execResult');
- if(r.error||r.err){res.innerHTML='<div class="alert error">'+(r.error||r.err)+'</div>';}
- else{res.innerHTML='<div class="alert success">'+r.msg+'</div>';I('execCmd').value='';}
- setTimeout(()=>res.innerHTML='',3000);
+
+// Renamed to submitCommand to avoid browser conflict
+async function submitCommand(){
+const cmd=I('execCmd').value.trim();
+if(!cmd){alert('Enter a command');return;}
+const r=await api('/api/exec','POST',{cmd});
+if(r.error)return;
+const res=I('execResult');
+if(r.error||r.err){res.innerHTML='<div class="alert error">'+(r.error||r.err)+'</div>';}
+else{res.innerHTML='<div class="alert success">'+r.msg+'</div>';I('execCmd').value='';}
+setTimeout(()=>res.innerHTML='',3000);
 }
+
 async function saveNetwork(){
- const ssid=I('wifiSsid').value.trim();
- const pass=I('wifiPass').value;
- const dhcp=I('wifiDhcp').checked;
- if(!ssid){alert('Enter SSID');return;}
- const body={ssid,pass,dhcp};
- if(!dhcp){
-  body.static_ip=I('staticIp').value;
-  body.gateway=I('gateway').value;
-  body.subnet=I('subnet').value;
-  body.dns=I('dns').value;
- }
- const r=await api('/api/network','POST',body);
- if(r.error)return;
- const res=I('networkResult');
- if(r.error||r.err){res.innerHTML='<div class="alert error">'+(r.error||r.err)+'</div>';}
- else{res.innerHTML='<div class="alert success">'+r.msg+'</div>';}
- setTimeout(()=>res.innerHTML='',5000);
+const ssid=I('wifiSsid').value.trim();
+const pass=I('wifiPass').value;
+const dhcp=I('wifiDhcp').checked;
+if(!ssid){alert('Enter SSID');return;}
+const body={ssid,pass,dhcp};
+if(!dhcp){
+ body.static_ip=I('staticIp').value;
+ body.gateway=I('gateway').value;
+ body.subnet=I('subnet').value;
+ body.dns=I('dns').value;
+}
+const r=await api('/api/network','POST',body);
+if(r.error)return;
+const res=I('networkResult');
+if(r.error||r.err){res.innerHTML='<div class="alert error">'+(r.error||r.err)+'</div>';}
+else{res.innerHTML='<div class="alert success">'+r.msg+'</div>';}
+setTimeout(()=>res.innerHTML='',5000);
 }
 async function refreshTasks(){
- const j=await api('/api/tasks');
- if(j.error)return;
- 
- I('taskCount').textContent=j.task_count||'-';
- if(j.core_summary){
-  if(j.core_summary['0']){
-   I('c0Tasks').textContent=j.core_summary['0'].tasks||'0';
-  }
-  if(j.core_summary['1']){
-   I('c1Tasks').textContent=j.core_summary['1'].tasks||'0';
-  }
+const j=await api('/api/tasks');
+if(j.error)return;
+
+I('taskCount').textContent=j.task_count||'-';
+if(j.core_summary){
+ if(j.core_summary['0']){
+ I('c0Tasks').textContent=j.core_summary['0'].tasks||'0';
  }
- 
- const taskMonitorEl = I('taskMonitor');
- if(!taskMonitorEl) return;
- 
- if(!j.tasks){taskMonitorEl.innerHTML='<p style="text-align:center;color:#8b949e">No tasks</p>';return;}
- j.tasks.sort((a,b)=>(b.runtime||0)-(a.runtime||0));
- let h='<div class="task-table-wrapper"><table class="task-table"><thead><tr><th>Task</th><th>Core</th><th>Pri</th><th>Stack</th><th>State</th><th>CPU%</th><th>Runtime</th></tr></thead><tbody>';
- j.tasks.forEach(t=>{
-  const cpuPct = Math.min(100, t.cpu_percent || 0);
-  h+=`<tr>
-    <td class="task-name">${t.name}</td>
-    <td><span class="core-badge ${coreCls(t.core)}">${t.core}</span></td>
-    <td>${t.priority}</td>
-    <td><span class="${healthCls(t.stack_health)}">${t.stack_hwm}</span></td>
-    <td><span class="task-state ${stCls(t.state)}">${t.state}</span></td>
-    <td><span class="cpu-badge ${cpuCls(cpuPct)}">${cpuPct}%</span>
-     <div class="progress-bar"><div class="progress-fill" style="width:${cpuPct}%"></div></div></td>
-    <td>${fmU((t.runtime||0)*1000)}</td>
-  </tr>`;
- });
- h+='</tbody></table></div>';
- taskMonitorEl.innerHTML=h;
+ if(j.core_summary['1']){
+ I('c1Tasks').textContent=j.core_summary['1'].tasks||'0';
+ }
+}
+
+const taskMonitorEl = I('taskMonitor');
+if(!taskMonitorEl) return;
+rowliteral";
+
+static const char INDEX_HTML_CMD_CARD[] PROGMEM = R"rawliteral(
+<div class="card condensed">
+ <h3>Command Exec</h3>
+ <div class="form-group">
+  <input type="text" id="execCmd" placeholder="Enter command...">
+ </div>
+ <button class="btn primary" onclick="submitCommand()">Execute</button>
+ <div id="execResult"></div>
+</div>
+)rawliteral";
+
+if(!j.tasks){taskMonitorEl.innerHTML='<p style="text-align:center;color:#8b949e">No tasks</p>';return;}
+j.tasks.sort((a,b)=>(b.runtime||0)-(a.runtime||0));
+let h='<div class="task-table-wrapper"><table class="task-table"><thead><tr><th>Task</th><th>Core</th><th>Pri</th><th>Stack</th><th>State</th><th>CPU%</th><th>Runtime</th></tr></thead><tbody>';
+j.tasks.forEach(t=>{
+ const cpuPct = Math.min(100, t.cpu_percent || 0);
+ h+=`<tr>
+  <td class="task-name">${t.name}</td>
+  <td><span class="core-badge ${coreCls(t.core)}">${t.core}</span></td>
+  <td>${t.priority}</td>
+  <td><span class="${healthCls(t.stack_health)}">${t.stack_hwm}</span></td>
+  <td><span class="task-state ${stCls(t.state)}">${t.state}</span></td>
+  <td><span class="cpu-badge ${cpuCls(cpuPct)}">${cpuPct}%</span>
+  <div class="progress-bar"><div class="progress-fill" style="width:${cpuPct}%"></div></div></td>
+  <td>${fmU((t.runtime||0)*1000)}</td>
+ </tr>`;
+});
+h+='</tbody></table></div>';
+taskMonitorEl.innerHTML=h;
 }
 async function refresh(){
- const j=await api('/api/status');
- if(j.error) {
-  if (j.error === 'ota_active') {
-  }
-  return;
+const j=await api('/api/status');
+if(j.error) {
+ if (j.error === 'ota_active') {
  }
- if(j.ota_active) {
-  location.reload();
-  return;
+ return;
+}
+if(j.ota_active) {
+  // OTA is active, but we don't reload the page anymore
+  // We just let the UI polling fail gracefully.
+ return;
+}
+I('bleDot').classList.toggle('on',!!j.ble);
+I('wifiDot').classList.toggle('on',!!j.connected);
+I('ipInfo').textContent=`IP: ${j.ip||'-'}`;
+I('rssiInfo').textContent=`RSSI: ${j.rssi||'--'}`;
+I('upt').textContent=fmU(j.uptime_ms||0);
+I('heap').textContent=fmB(j.heap_free||0);
+I('heapTot').textContent=fmB(j.heap_total||0);
+I('c0').textContent=j.core0_load??'-';
+I('c1').textContent=j.core1_load??'-';
+I('chip').textContent=j.chip_model||'-';
+I('cpuFreq').textContent=j.cpu_freq||'-';
+if(j.temp_c===null||j.temp_c===undefined){I('tempC').textContent='n/a';}
+else{I('tempC').textContent=j.temp_c.toFixed?j.temp_c.toFixed(1)+'°C':j.temp_c+'°C';}
+
+if(j.memory){
+ I('flashSize').textContent=j.memory.flash_mb||'--';
+ if(j.memory.has_psram){
+ I('psramPill').style.display='inline-block';
+ const psramUsed = (j.memory.psram_total - j.memory.psram_free);
+ I('psramUsed').textContent=fmB(psramUsed);
+ I('psramTotal').textContent=fmB(j.memory.psram_total);
+ }else{
+ I('psramPill').style.display='none';
  }
- I('bleDot').classList.toggle('on',!!j.ble);
- I('wifiDot').classList.toggle('on',!!j.connected);
- I('ipInfo').textContent=`IP: ${j.ip||'-'}`;
- I('rssiInfo').textContent=`RSSI: ${j.rssi||'--'}`;
- I('upt').textContent=fmU(j.uptime_ms||0);
- I('heap').textContent=fmB(j.heap_free||0);
- I('heapTot').textContent=fmB(j.heap_total||0);
- I('c0').textContent=j.core0_load??'-';
- I('c1').textContent=j.core1_load??'-';
- I('chip').textContent=j.chip_model||'-';
- I('cpuFreq').textContent=j.cpu_freq||'-';
- if(j.temp_c===null||j.temp_c===undefined){I('tempC').textContent='n/a';}
- else{I('tempC').textContent=j.temp_c.toFixed?j.temp_c.toFixed(1)+'°C':j.temp_c+'°C';}
- 
- if(j.memory){
-  I('flashSize').textContent=j.memory.flash_mb||'--';
-  if(j.memory.has_psram){
-   I('psramPill').style.display='inline-block';
-   const psramUsed = (j.memory.psram_total - j.memory.psram_free);
-   I('psramUsed').textContent=fmB(psramUsed);
-   I('psramTotal').textContent=fmB(j.memory.psram_total);
-  }else{
-   I('psramPill').style.display='none';
-  }
- }
- 
- if(j.num_cores===1){I('c1pill').style.display='none';}else{I('c1pill').style.display='inline-block';}
- if(j.biz){
-  I('bizState').textContent=j.biz.running?'RUNNING':'STOPPED';
-  I('bizQueue').textContent=j.biz.queue??'-';
-  I('bizProcessed').textContent=j.biz.processed??'-';
- }
+}
+
+if(j.num_cores===1){I('c1pill').style.display='none';}else{I('c1pill').style.display='inline-block';}
+if(j.biz){
+ I('bizState').textContent=j.biz.running?'RUNNING':'STOPPED';
+ I('bizQueue').textContent=j.biz.queue??'-';
+ I('bizProcessed').textContent=j.biz.processed??'-';
+}
 }
 )rawliteral";
 
@@ -2591,6 +2612,7 @@ if(document.getElementById('otaAvailable')){
  otaInterval = setInterval(refreshOTA,2000);
  refreshOTA();
 }
+I('execCmd').addEventListener('keyup', e => { if (e.key === 'Enter') submitCommand(); }); // <--- ADDED THIS LINE
 </script>
 </body>
 </html>
@@ -2766,15 +2788,45 @@ void bizTask(void* param) {
     esp_task_wdt_reset();
 
     if (gBizState == BIZ_RUNNING && !isOtaActive()) {
+      // Actively wait for a message
       if (execQ && xQueueReceive(execQ, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+        
+        Serial.println("\n[bizTask] Received a message from queue.");
+
         if (msg) {
-          vTaskDelay(pdMS_TO_TICKS(50));
-          bizProcessed++;
-          freeMessage(msg);
-          msg = nullptr;
+          
+          Serial.printf("[bizTask] Message payload: '%s' (Length: %d)\n", msg->payload, msg->length);
+          
+          String cmd = String(msg->payload);
+          cmd.toLowerCase(); // Make it case-insensitive
+
+          if (cmd.equals("reset") || cmd.equals("reboot")) {
+            
+            Serial.println("[bizTask] Command MATCHED 'reset' or 'reboot'.");
+            Serial.println(F("bizTask: Reboot command received. Restarting in 500ms..."));
+            
+            freeMessage(msg);
+            msg = nullptr;
+            vTaskDelay(pdMS_TO_TICKS(500)); // Delay to allow web response to send
+            ESP.restart();
+            // Will not get here
+          
+          } else { 
+            
+            Serial.printf("[bizTask] Command '%s' did NOT match reboot logic. Processing as other command.\n", cmd.c_str());
+            
+            // This is your "work" for other commands
+            vTaskDelay(pdMS_TO_TICKS(50));
+            bizProcessed++;
+            freeMessage(msg);
+            msg = nullptr;
+          }
+        } else {
+            Serial.println("[bizTask] Received a NULL message from queue. This should not happen.");
         }
       }
     } else {
+      // Not running, so just idle
       vTaskDelay(pdMS_TO_TICKS(100));
     }
   }
