@@ -1,74 +1,53 @@
+/* ==============================================================================
+   WEB_HANDLER.H - Web Server Interface
+   
+   Defines web server functionality:
+   - REST API endpoints for system control and monitoring
+   - File upload handling
+   - CORS support for web applications
+   - Web-based configuration interface
+   
+   Web server provides remote access to system functions via HTTP.
+   ============================================================================== */
+
+/* Header guard to prevent multiple inclusion of web_handler.h */
 #ifndef WEB_HANDLER_H
 #define WEB_HANDLER_H
 
 #include <Arduino.h>
+#include "config.h"
 
-// ============================================================================
-// WEB SERVER FUNCTIONS
-// ============================================================================
-
-/**
- * @brief Register all web routes
- */
 void registerRoutes();
 
-/**
- * @brief Send main HTML page
- */
 void sendIndex();
 
-/**
- * @brief API: Get system status
- */
 void handleApiStatus();
 
-/**
- * @brief API: Start business logic
- */
 void handleApiBizStart();
 
-/**
- * @brief API: Stop business logic
- */
 void handleApiBizStop();
 
-/**
- * @brief API: Execute command
- */
 void handleApiExec();
 
-/**
- * @brief API: Configure network
- */
 void handleApiNetwork();
 
 #if DEBUG_MODE
-/**
- * @brief API: Get task monitoring data
- */
+
 void handleApiTasks();
 
-/**
- * @brief API: Get debug logs
- */
 void handleApiDebugLogs();
 
-/**
- * @brief API: Clear debug logs
- */
 void handleApiDebugClear();
 #endif
 
 #if ENABLE_OTA
-/**
- * @brief Check if OTA is active
- */
+
 bool isOtaActive();
 
-/**
- * @brief Send 503 busy JSON response
- */
 void sendBusyJson(const char* msg = "OTA in progress");
+#else
+inline bool isOtaActive() { return false; }
+inline void sendBusyJson(const char* msg = "OTA in progress") { (void)msg; } 
 #endif
 
-#endif // WEB_HANDLER_H
+#endif

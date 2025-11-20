@@ -1,3 +1,17 @@
+/* ==============================================================================
+   BLE_HANDLER.CPP - Bluetooth Low Energy Implementation
+   
+   Implements BLE server with custom service for device configuration:
+   - TX characteristic: Device sends status to phone/computer
+   - RX characteristic: Device receives commands from phone/computer
+   - Handles WiFi credential provisioning
+   - Processes system control commands (reboot, clear WiFi, etc.)
+   - Manages connection LED indication
+   
+   BLE enables wireless configuration when WiFi is not yet set up.
+   Commands are JSON formatted for structured communication.
+   ============================================================================== */
+
 #include "ble_handler.h"
 #include "globals.h"
 #include "wifi_handler.h"
@@ -6,7 +20,6 @@
 
 #if ESP32_HAS_BLE
 
-// Helper functions
 static String cleanString(const String& input);
 static bool isValidIP(const String& s);
 static bool isValidSubnet(const String& s);
@@ -86,6 +99,7 @@ class MyCharCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+/* initBLE: Initializes Bluetooth Low Energy server with custom service for configuration */
 void initBLE() {
   NimBLEDevice::init(BLE_ADVERT_NAME);
   NimBLEDevice::setMTU(256);
@@ -203,10 +217,19 @@ void handleBLECommand(String cmd) {
       }
     }
 
+    if (pass.length() == 0 && wifiCredentials.hasCredentials) {
+      if (ssid.equals(String(wifiCredentials.ssid))) {
+
+        pass = String(wifiCredentials.password);
+        Serial.println(F("BLE: Preserving existing WiFi password (SSID unchanged)"));
+      }
+    }
+
     saveWiFi(ssid, pass);
     sendBLE("OK:WIFI_SAVED\n");
     delay(100);
 
+    /* Acquire wifiMutex mutex (wait up to 1000ms) to safely access shared resource */
     if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
       wifiManualDisconnect = false;
       wifiReconnectAttempts = 0;
@@ -224,7 +247,8 @@ void handleBLECommand(String cmd) {
       delay(100);
 
       if (wifiCredentials.hasCredentials) {
-        if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        /* Acquire wifiMutex mutex (wait up to 1000ms) to safely access shared resource */
+    if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
           wifiManualDisconnect = false;
           wifiReconnectAttempts = 0;
           wifiConfigChanged = true;
@@ -256,7 +280,8 @@ void handleBLECommand(String cmd) {
           delay(100);
 
           if (wifiCredentials.hasCredentials) {
-            if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            /* Acquire wifiMutex mutex (wait up to 1000ms) to safely access shared resource */
+    if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
               wifiManualDisconnect = false;
               wifiReconnectAttempts = 0;
               wifiConfigChanged = true;
@@ -295,6 +320,7 @@ void handleBLECommand(String cmd) {
     sendBLE(response);
 
   } else if (upper == "DISCONNECT_WIFI" || upper == "DISCONNECT") {
+    /* Acquire wifiMutex mutex (wait up to 1000ms) to safely access shared resource */
     if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
       wifiManualDisconnect = true;
       wifiState = WIFI_STATE_IDLE;
@@ -306,21 +332,22 @@ void handleBLECommand(String cmd) {
     prefs.remove("wifi_ssid");
     prefs.remove("wifi_pass");
     saveWiFi("", "");
+    /* Acquire wifiMutex mutex (wait up to 1000ms) to safely access shared resource */
     if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
       wifiManualDisconnect = true;
       wifiState = WIFI_STATE_IDLE;
       xSemaphoreGive(wifiMutex);
     }
     sendBLE("OK:WIFI_CLEARED\n");
-    Serial.println(F("=== WiFi Credentials Cleared ==="));  // NEW: Better debug output
+    Serial.println(F("=== WiFi Credentials Cleared ==="));
 
   } else if (upper == "RESTART") {
-    Serial.println(F("\n=== BLE: Restart Command Received ==="));  // NEW: Better debug output
+    Serial.println(F("\n=== BLE: Restart Command Received ==="));
     sendBLE("OK:RESTARTING\n");
-    delay(500);  // NEW: Longer delay to ensure BLE message is sent
+    delay(500);
     #if DEBUG_MODE
     prefs.putBool(NVS_FLAG_USER_REBOOT, true);
-    vTaskDelay(pdMS_TO_TICKS(100));  // NEW: Use RTOS-safe delay
+    vTaskDelay(pdMS_TO_TICKS(100));
     #endif
     ESP.restart();
 
@@ -344,7 +371,6 @@ void handleBLECommand(String cmd) {
   }
 }
 
-// Helper functions
 static String cleanString(const String& input) {
   if (input.length() == 0) return String();
   const char* str = input.c_str();
@@ -386,7 +412,8 @@ static IPAddress parseIP(const String& s) {
 }
 
 #else
-// Stubs if BLE not available
+
+/* initBLE: Initializes Bluetooth Low Energy server with custom service for configuration */
 void initBLE() {}
 void handleBLEReconnect() {}
 void sendBLE(const String& m) { (void)m; }

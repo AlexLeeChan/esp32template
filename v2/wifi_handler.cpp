@@ -1,3 +1,17 @@
+/* ==============================================================================
+   WIFI_HANDLER.CPP - WiFi Management Implementation
+   
+   Implements WiFi connectivity with automatic reconnection:
+   - Loads credentials from NVS (non-volatile storage)
+   - Connects to WiFi with configurable timeout
+   - Monitors connection status and reconnects on failure
+   - Applies DHCP or static IP configuration
+   - Synchronizes time via NTP when connected
+   
+   State machine ensures robust WiFi connectivity with exponential backoff
+   on repeated failures to prevent connection storms.
+   ============================================================================== */
+
 #include "wifi_handler.h"
 #include "globals.h"
 #include <esp_wifi.h>
@@ -15,14 +29,15 @@ void setupWiFi() {
       case ARDUINO_EVENT_WIFI_STA_CONNECTED:
         break;
       case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-        if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (wifiMutex && xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           wifiState = WIFI_STATE_CONNECTED;
           xSemaphoreGive(wifiMutex);
         }
+        Serial.printf("WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
         break;
       case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         if (!wifiManualDisconnect) {
-          if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          if (wifiMutex && xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             wifiState = WIFI_STATE_DISCONNECTED;
             xSemaphoreGive(wifiMutex);
           }
@@ -43,7 +58,7 @@ void startWiFiConnection() {
     return;
   }
 
-  if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+  if (wifiMutex && xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
     WiFi.begin(wifiCredentials.ssid, wifiCredentials.password);
     wifiState = WIFI_STATE_CONNECTING;
     wifiLastConnectAttempt = millis();
@@ -60,7 +75,7 @@ void checkWiFiConnection() {
   if (otaInProgress) return;
 #endif
 
-  if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+  if (!wifiMutex || xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
     return;
   }
 
@@ -213,7 +228,8 @@ void saveWiFi(const String& s, const String& p) {
   if (!prefs.putString("wifi_ssid", s)) {
     LOG_ERROR(F("Failed to save WiFi SSID"), millis() / 1000);
   }
-  if (!prefs.putString("wifi_pass", p)) {
+
+  if (!prefs.putString("wifi_pass", p) && p.length() > 0) {
     LOG_ERROR(F("Failed to save WiFi password"), millis() / 1000);
   }
 

@@ -1,40 +1,30 @@
+/* ==============================================================================
+   TIME_HANDLER.H - Time Management Interface
+   
+   Provides time-related functions:
+   - NTP synchronization
+   - Epoch timestamp retrieval
+   - Time formatting
+   
+   Ensures accurate timekeeping for logging and scheduling.
+   ============================================================================== */
+
+/* Header guard to prevent multiple inclusion of time_handler.h */
 #ifndef TIME_HANDLER_H
 #define TIME_HANDLER_H
 
 #include <Arduino.h>
 
-// ============================================================================
-// TIME FUNCTIONS
-// ============================================================================
-
-/**
- * @brief Initialize NTP client
- */
 void initNTP();
 
-/**
- * @brief Synchronize time with NTP servers
- */
 void syncNTP();
 
-/**
- * @brief Check if time is synchronized
- */
 bool getTimeInitialized();
 
-/**
- * @brief Get current time as string
- */
 String getCurrentTimeString();
 
-/**
- * @brief Get current epoch time
- */
 uint32_t getEpochTime();
 
-/**
- * @brief Check if NTP sync is needed
- */
 bool shouldSyncNTP();
 
-#endif // TIME_HANDLER_H
+#endif

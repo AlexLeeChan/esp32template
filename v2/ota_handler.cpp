@@ -1,27 +1,38 @@
+/* ==============================================================================
+   OTA_HANDLER.CPP - Over-The-Air Update Implementation
+   
+   Implements firmware update functionality:
+   1. Downloads new firmware from URL (HTTP/HTTPS)
+   2. Validates file size and partition availability
+   3. Flashes firmware to inactive partition
+   4. Verifies update and triggers reboot on success
+   
+   Process involves stopping non-essential tasks during update to free memory
+   and ensure stability. Progress is reported via mutex-protected status structure.
+   ============================================================================== */
+
 #include "ota_handler.h"
 
 #if ENABLE_OTA
 
+/* OTA (Over-The-Air) update functionality is enabled */
+
 #include "globals.h"
 #include "web_handler.h"
 #include "debug_handler.h"
-#include "tasks.h"  // ADD THIS - for task function declarations
+#include "tasks.h"
 #include <Update.h>
 #include <esp_ota_ops.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <esp_partition.h>
 #include <esp_task_wdt.h>
-#include <esp_wifi.h>  // ADD THIS - for esp_wifi_set_ps
-#include <ArduinoJson.h>  // ADD THIS - for JSON handling
+#include <esp_wifi.h>
+#include <ArduinoJson.h>
 
-// Forward declaration for OTA task function
 static void otaTaskFunction(void* param);
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
+/* dumpPartitionInfo: Lists all flash partitions and identifies the active/next OTA partitions */
 void dumpPartitionInfo(String& logOutput) {
   logOutput = "--- Partition Table ---\n";
   const esp_partition_t* running = esp_ota_get_running_partition();
@@ -62,8 +73,10 @@ void dumpPartitionInfo(String& logOutput) {
   }
 }
 
+/* deleteNonEssentialTasks: Safely stops business logic task before OTA update to free memory */
 void deleteNonEssentialTasks() {
-  if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+  /* Acquire taskDeletionMutex mutex (wait up to 500ms) to safely access shared resource */
+    if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
 
     if (bizTaskHandle != NULL) {
       Serial.println(F("\n=== Stopping bizTask for OTA ==="));
@@ -97,8 +110,10 @@ void deleteNonEssentialTasks() {
   }
 }
 
+/* deleteWebTask: Stops web server task before final OTA flash to ensure stability */
 void deleteWebTask() {
-  if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+  /* Acquire taskDeletionMutex mutex (wait up to 500ms) to safely access shared resource */
+    if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
     if (webTaskHandle != NULL) {
       Serial.println(F("\n=== Stopping webTask for OTA Flash ==="));
       webTaskShouldExit = true;
@@ -125,8 +140,10 @@ void deleteWebTask() {
   }
 }
 
+/* recreateTasks: Restarts tasks after OTA failure to restore normal operation */
 void recreateTasks() {
-  if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+  /* Acquire taskDeletionMutex mutex (wait up to 500ms) to safely access shared resource */
+    if (xSemaphoreTake(taskDeletionMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
 
     Serial.println(F("\n=== Recreating Tasks After OTA Failure ==="));
 
@@ -173,17 +190,21 @@ void recreateTasks() {
   }
 }
 
-// ============================================================================
-// API HANDLERS
-// ============================================================================
+/* handleOTAStatus: API endpoint that returns current OTA update status and partition info */
 
+/* ============================================================================
+   API ENDPOINTS - Functions called by HTTP requests
+   ============================================================================ */
+
+/* handleOTAStatus: API endpoint that returns current OTA update status and partition info */
 void handleOTAStatus() {
   DynamicJsonDocument doc(512);
 
   const esp_partition_t* ota_partition = esp_ota_get_next_update_partition(NULL);
   otaStatus.available = (ota_partition != NULL);
 
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     doc["available"] = otaStatus.available;
     doc["state"] = (uint8_t)otaStatus.state;
     doc["progress"] = otaStatus.progress;
@@ -220,7 +241,8 @@ void handleOTAInfo() {
 }
 
 void handleOTAReset() {
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     otaStatus.state = OTA_IDLE;
     otaStatus.progress = 0;
     otaStatus.error = "";
@@ -239,19 +261,15 @@ void registerOtaRoutes() {
   server.on("/api/ota/info", HTTP_GET, handleOTAInfo);
 }
 
-// ============================================================================
-// MAIN OTA UPDATE HANDLER
-// ============================================================================
-
+/* handleOTAUpdate: Main API endpoint that initiates OTA update process from provided URL */
 void handleOTAUpdate() {
-  // Check for request body
+
   if (!server.hasArg("plain")) {
     server.send(400, F("application/json"), F("{\"err\":\"no body\"}"));
     LOG_ERROR(F("OTA: No request body"), millis() / 1000);
     return;
   }
 
-  // Parse JSON
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, server.arg("plain"));
   if (error) {
@@ -260,7 +278,6 @@ void handleOTAUpdate() {
     return;
   }
 
-  // Validate URL
   const char* url = doc["url"] | "";
   if (strlen(url) == 0) {
     server.send(400, F("application/json"), F("{\"err\":\"url required\"}"));
@@ -268,15 +285,14 @@ void handleOTAUpdate() {
     return;
   }
 
-  // Check WiFi connection
   if (WiFi.status() != WL_CONNECTED) {
     server.send(503, F("application/json"), F("{\"err\":\"WiFi not connected\"}"));
     LOG_ERROR(F("OTA: WiFi not connected"), millis() / 1000);
     return;
   }
 
-  // Check if OTA is already in progress
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     if (otaStatus.state != OTA_IDLE) {
       xSemaphoreGive(otaMutex);
       server.send(409, F("application/json"), F("{\"err\":\"update in progress\"}"));
@@ -290,20 +306,38 @@ void handleOTAUpdate() {
     xSemaphoreGive(otaMutex);
   }
 
-  // Send "OK" response immediately
   server.send(200, F("application/json"), F("{\"msg\":\"update started\"}"));
   server.client().flush();
   delay(100);
 
-  // Create a heap-allocated copy of the URL for the new task
+  
+  Serial.println(F("\n=== Pre-OTA Memory Cleanup ==="));
+  Serial.printf("Initial Free Heap: %u bytes\n", ESP.getFreeHeap());
+
+  #if ESP32_HAS_BLE
+  Serial.println(F("Deinitializing BLE..."));
+  NimBLEDevice::deinit();
+  vTaskDelay(pdMS_TO_TICKS(200));
+  Serial.printf("After BLE deinit: %u bytes\n", ESP.getFreeHeap());
+  #endif
+
+  Serial.println(F("Deleting non-essential tasks..."));
+  /* Free memory by stopping business logic task (OTA needs ~150KB free) */
+  deleteNonEssentialTasks();
+  vTaskDelay(pdMS_TO_TICKS(300));
+  Serial.printf("After task deletion: %u bytes\n", ESP.getFreeHeap());
+
+  otaInProgress = true;
+
   String* otaUrlPtr = new String(url);
 
   uint32_t freeHeap = ESP.getFreeHeap();
-  Serial.printf("Pre-OTA Free Heap: %u bytes\n", freeHeap);
+  Serial.printf("Final Free Heap: %u bytes\n", freeHeap);
+  Serial.println(F("=== Cleanup Complete ===\n"));
 
-  // Check heap before starting task
-  if (freeHeap < 50000) {
+  if (freeHeap < 35000) {
     Serial.println(F("ERROR: Insufficient memory for OTA!"));
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = F("Insufficient memory");
@@ -311,14 +345,17 @@ void handleOTAUpdate() {
     }
     LOG_ERROR(F("OTA: Insufficient memory"), millis() / 1000);
     delete otaUrlPtr;
+    
+
+    otaInProgress = false;
+    recreateTasks();
     return;
   }
 
-  // Create the dedicated OTA task
   BaseType_t taskCreated = xTaskCreate(
     otaTaskFunction,
     "ota_task",
-    24576,
+    20480,
     (void*)otaUrlPtr,
     3,
     NULL
@@ -327,6 +364,7 @@ void handleOTAUpdate() {
   if (taskCreated != pdPASS) {
     Serial.println(F("CRITICAL: Failed to create OTA task!"));
 
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = F("Task creation failed");
@@ -338,16 +376,24 @@ void handleOTAUpdate() {
   }
 }
 
-// ============================================================================
-// OTA TASK FUNCTION (runs in dedicated task)
-// ============================================================================
+/* ============================================================================
+   OTA BACKGROUND TASK
+   
+   Background task that downloads and flashes new firmware:
+   1. Connects to update server (HTTP/HTTPS with auto-redirect)
+   2. Downloads firmware file
+   3. Flashes to inactive partition
+   4. Verifies integrity and reboots on success
+   
+   Runs as separate FreeRTOS task to avoid blocking the web server during
+   the potentially lengthy download process.
+   ============================================================================ */
 
 static void otaTaskFunction(void* param) {
-  // --- This code runs in the new 'ota_task' ---
+
   esp_task_wdt_add(NULL);
   esp_task_wdt_reset();
 
-  // Get URL and free the heap allocation
   String* urlPtr = (String*)param;
   String url = *urlPtr;
   delete urlPtr;
@@ -361,33 +407,18 @@ Serial.println(F("==========================================="));
   vTaskDelay(pdMS_TO_TICKS(300));
   esp_task_wdt_reset();
 
-  // Re-register OTA routes in case they were lost
   server.on("/api/ota/status", HTTP_GET, handleOTAStatus);
   server.on("/api/ota/reset", HTTP_POST, handleOTAReset);
   server.on("/api/ota/update", HTTP_POST, handleOTAUpdate);
 
-  // Stop other tasks to free up heap and prevent conflicts
-  deleteNonEssentialTasks();
-  esp_task_wdt_reset();
-
-  #if ESP32_HAS_BLE
-  Serial.println(F("Stopping BLE to free heap..."));
-  NimBLEDevice::deinit();
-  vTaskDelay(pdMS_TO_TICKS(100));
-  Serial.printf("Heap after BLE deinit: %u bytes\n", ESP.getFreeHeap());
-  #endif
-
-  // Set global flag to pause WiFi management in systemTask
-  otaInProgress = true;
-  Serial.println(F("OTA in progress flag set - WiFi management disabled"));
-
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     otaStatus.state = OTA_DOWNLOADING;
     otaStatus.progress = 1;
     xSemaphoreGive(otaMutex);
   }
 
-  // Disable WiFi power save for max download speed
   esp_wifi_set_ps(WIFI_PS_NONE);
   Serial.println(F("WiFi power save disabled"));
 
@@ -400,8 +431,7 @@ Serial.println(F("==========================================="));
 
   bool isSecure = url.startsWith("https://");
 
-  // Configure clients
-  clientSecure.setInsecure(); // Allow self-signed certs
+  clientSecure.setInsecure();
   clientSecure.setTimeout(30);
   client.setTimeout(30);
 
@@ -420,11 +450,40 @@ Serial.println(F("==========================================="));
 
   esp_task_wdt_reset();
 
-  // --- 1. HTTP GET Request ---
   Serial.println(F("Sending HTTP GET request..."));
   int httpCode = httpClient.GET();
 
-  // Handle redirects manually (more robust)
+  if (httpCode == -1 && !isSecure) {
+    Serial.println(F("HTTP connection refused. Retrying with HTTPS..."));
+    
+    httpClient.end();
+    client.stop();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+
+    String httpsUrl = url;
+    httpsUrl.replace("http://", "https://");
+    
+    Serial.printf("Retrying with HTTPS: %s\n", httpsUrl.c_str());
+    
+
+    clientSecure.setInsecure();
+    clientSecure.setTimeout(30);
+    httpClient.begin(clientSecure, httpsUrl);
+    httpClient.setUserAgent(F("ESP32-OTA/1.0"));
+    httpClient.setTimeout(15000);
+    httpClient.setReuse(false);
+    
+    isSecure = true;
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_task_wdt_reset();
+    
+    Serial.println(F("Sending HTTPS GET request..."));
+    httpCode = httpClient.GET();
+    Serial.printf("HTTPS attempt result: HTTP code %d\n", httpCode);
+  }
+
   if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND ||
       httpCode == HTTP_CODE_SEE_OTHER || httpCode == HTTP_CODE_TEMPORARY_REDIRECT) {
 
@@ -462,18 +521,31 @@ Serial.println(F("==========================================="));
     Serial.printf("After redirect, HTTP code: %d\n", httpCode);
   }
 
-  // Check for HTTP OK
   if (httpCode != HTTP_CODE_OK) {
-    char errStr[160];
+    char errStr[200];
     String location = httpClient.getLocation();
     if (location.length() > 0 && httpCode >= 300 && httpCode < 400) {
       snprintf(errStr, sizeof(errStr), "HTTP %d -> %s", httpCode, location.c_str());
+    } else if (httpCode == -1) {
+
+      if (isSecure) {
+        snprintf(errStr, sizeof(errStr), "Connection refused (tried HTTPS). Check URL.");
+      } else {
+        snprintf(errStr, sizeof(errStr), "Connection refused. Check URL and network.");
+      }
+    } else if (httpCode == -2) {
+      snprintf(errStr, sizeof(errStr), "Send header failed. Check WiFi connection.");
+    } else if (httpCode == -3) {
+      snprintf(errStr, sizeof(errStr), "Connection lost during request.");
+    } else if (httpCode == -11) {
+      snprintf(errStr, sizeof(errStr), "Read timeout. Server not responding.");
     } else {
       snprintf(errStr, sizeof(errStr), "HTTP %d: %s",
                httpCode, httpClient.errorToString(httpCode).c_str());
     }
     Serial.printf("ERROR: %s\n", errStr);
 
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = errStr;
@@ -481,7 +553,6 @@ Serial.println(F("==========================================="));
     }
     LOG_ERROR(String("OTA: ") + errStr, millis() / 1000);
 
-    // --- Failure Cleanup ---
     otaInProgress = false;
     httpClient.end();
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
@@ -491,12 +562,12 @@ Serial.println(F("==========================================="));
     return;
   }
 
-  // --- 2. Check Content Length ---
   int contentLength = httpClient.getSize();
   if (contentLength <= 0) {
     const char* msg = "Invalid content length";
     Serial.println(F("ERROR: Invalid Content-Length"));
 
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = msg;
@@ -504,7 +575,6 @@ Serial.println(F("==========================================="));
     }
     LOG_ERROR(String("OTA: ") + msg, millis() / 1000);
 
-    // --- Failure Cleanup ---
     otaInProgress = false;
     httpClient.end();
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
@@ -517,19 +587,20 @@ Serial.println(F("==========================================="));
   Serial.printf("HTTP OK - Content-Length: %d bytes (%.2f MB)\n",
                 contentLength, contentLength / 1048576.0);
 
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     otaStatus.fileSize = contentLength;
     xSemaphoreGive(otaMutex);
   }
 
   esp_task_wdt_reset();
 
-  // --- 3. Check Partition Availability & Size ---
   const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
   if (!update_partition) {
     const char* msg = "No OTA partition";
     Serial.println(F("ERROR: No OTA partition available!"));
 
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = msg;
@@ -537,7 +608,6 @@ Serial.println(F("==========================================="));
     }
     LOG_ERROR(String("OTA: ") + msg, millis() / 1000);
 
-    // --- Failure Cleanup ---
     otaInProgress = false;
     httpClient.end();
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
@@ -554,6 +624,7 @@ Serial.println(F("==========================================="));
              contentLength, update_partition->size);
     Serial.println(errStr);
 
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = errStr;
@@ -561,7 +632,6 @@ Serial.println(F("==========================================="));
     }
     LOG_ERROR(String("OTA: ") + errStr, millis() / 1000);
 
-    // --- Failure Cleanup ---
     otaInProgress = false;
     httpClient.end();
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
@@ -574,18 +644,18 @@ Serial.println(F("==========================================="));
   Serial.printf("Target partition: %s (%.2f MB)\n",
                 update_partition->label, update_partition->size / 1048576.0);
 
-  // --- 4. Begin Update (Download & Flash) ---
-  Update.abort(); // Ensure no previous update is pending
+  Update.abort();
   vTaskDelay(pdMS_TO_TICKS(100));
   esp_task_wdt_reset();
 
   Serial.println(F("\nStarting Update.begin()..."));
-  if (!Update.begin(contentLength, U_FLASH)) {
+  if (!Update.begin(contentLength, U_FLASH)  /* Initialize OTA flash writer with file size */) {
     char errStr[128];
     snprintf(errStr, sizeof(errStr), "Update.begin() error: %u", Update.getError());
     Serial.printf("ERROR: %s\n", errStr);
     Serial.println(Update.errorString());
 
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = errStr;
@@ -593,7 +663,6 @@ Serial.println(F("==========================================="));
     }
     LOG_ERROR(String("OTA: ") + errStr, millis() / 1000);
 
-    // --- Failure Cleanup ---
     otaInProgress = false;
     httpClient.end();
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
@@ -615,19 +684,18 @@ Serial.println(F("==========================================="));
   uint8_t lastPrintedPercent = 0;
   uint8_t buff[1024];
 
-// --- Download and Flash Loop ---
   while (written < (size_t)contentLength) {
     if (millis() - lastWdtReset > 5000) {
       esp_task_wdt_reset();
       lastWdtReset = millis();
     }
 
-    // Check for WiFi disconnect during download
     if (WiFi.status() != WL_CONNECTED) {
       const char* msg = "WiFi disconnected";
       Serial.println(F("\nERROR: WiFi disconnected!"));
 
-      if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         otaStatus.state = OTA_FAILED;
         otaStatus.error = msg;
         xSemaphoreGive(otaMutex);
@@ -649,6 +717,7 @@ Serial.println(F("==========================================="));
       int len = stream->readBytes(buff, min(sizeof(buff), available));
 
       if (len > 0) {
+        /* Write downloaded chunk to flash - must write exactly len bytes */
         if (Update.write(buff, len) != (size_t)len) {
           char errStr[128];
           snprintf(errStr, sizeof(errStr),
@@ -656,7 +725,8 @@ Serial.println(F("==========================================="));
                    (unsigned)written, contentLength, Update.getError());
           Serial.printf("\nERROR: %s\n", errStr);
 
-          if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             otaStatus.state = OTA_FAILED;
             otaStatus.error = errStr;
             xSemaphoreGive(otaMutex);
@@ -675,12 +745,12 @@ Serial.println(F("==========================================="));
 
         written += len;
 
-        // Update progress
         if (millis() - lastProgress > 500 || written >= (size_t)contentLength) {
           lastProgress = millis();
           uint8_t progress = (written * 100) / contentLength;
 
-          if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          /* Acquire otaMutex mutex (wait up to 5ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             otaStatus.progress = progress;
             xSemaphoreGive(otaMutex);
           }
@@ -693,25 +763,23 @@ Serial.println(F("==========================================="));
         }
       }
     }
-    vTaskDelay(1); // Yield for other tasks
+    vTaskDelay(1);
   }
 
   httpClient.end();
   Serial.printf("\nDownload complete! %u bytes written\n", (unsigned)written);
 
-  // --- 5. Finalize Update ---
   Serial.println(F("Setting state to FLASHING"));
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     otaStatus.state = OTA_FLASHING;
     otaStatus.progress = 100;
     xSemaphoreGive(otaMutex);
   }
 
-  // Give web UI time to see the "FLASHING" state
   Serial.println(F("Waiting 2s for UI to update..."));
   vTaskDelay(pdMS_TO_TICKS(2000));
 
-  // Stop the web server task (it's served its purpose)
   deleteWebTask();
   vTaskDelay(pdMS_TO_TICKS(200));
   esp_task_wdt_reset();
@@ -723,6 +791,7 @@ Serial.println(F("==========================================="));
     snprintf(errStr, sizeof(errStr), "Update.end() error: %u", Update.getError());
     Serial.printf("ERROR: %s\n", errStr);
 
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = errStr;
@@ -730,7 +799,6 @@ Serial.println(F("==========================================="));
     }
     LOG_ERROR(String("OTA: ") + errStr, millis() / 1000);
 
-    // --- Failure Cleanup ---
     otaInProgress = false;
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     esp_task_wdt_delete(NULL);
@@ -743,6 +811,7 @@ Serial.println(F("==========================================="));
     const char* msg = "Update incomplete";
     Serial.println(F("ERROR: Update not finished!"));
 
+    /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
     if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       otaStatus.state = OTA_FAILED;
       otaStatus.error = msg;
@@ -750,7 +819,6 @@ Serial.println(F("==========================================="));
     }
     LOG_ERROR(String("OTA: ") + msg, millis() / 1000);
 
-    // --- Failure Cleanup ---
     otaInProgress = false;
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     esp_task_wdt_delete(NULL);
@@ -759,13 +827,13 @@ Serial.println(F("==========================================="));
     return;
   }
 
-  // --- 6. Success! ---
 Serial.println(F("\n==========================================="));
 Serial.println(F("         OTA UPDATE SUCCESS!"));
 Serial.println(F("==========================================="));
   Serial.println(F("Rebooting in 2 seconds...\n"));
 
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     otaStatus.state = OTA_SUCCESS;
     otaStatus.progress = 100;
     xSemaphoreGive(otaMutex);
@@ -778,7 +846,7 @@ Serial.println(F("==========================================="));
   #if DEBUG_MODE
   prefs.putBool("userRebootRequested", true);
   #endif
-  ESP.restart();
+  ESP.restart();  /* Reboot to boot from newly flashed partition */
 }
 
-#endif // ENABLE_OTA
+#endif

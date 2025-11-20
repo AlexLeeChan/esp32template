@@ -1,88 +1,30 @@
-/**
- * ============================================================================
- * ESP32(x) Universal Control Template
- * ============================================================================
- * 
- * A production-ready ESP32 firmware template featuring:
- *   • FreeRTOS task management with monitoring
- *   • BLE (NimBLE) for wireless configuration
- *   • WiFi with automatic reconnection
- *   • Web server with REST API
- *   • OTA firmware updates (optional)
- *   • Flash-safe initialization order
- *   • Comprehensive error logging
- * 
- * CHANGELOG (Latest First):
- * ----------------------------------------------------------------------------
- * v1.3 - Multi-File Refactoring
- *   [REFACTOR] Split monolithic code into modular files
- *   [IMPROVE] Proper C/C++ structure with headers
- *   [IMPROVE] Arduino IDE compatible file organization
- *   [IMPROVE] Easier maintenance and debugging
- * 
- * v1.2 - Critical WiFi Bug Fix & Performance Improvements
- *   [CRITICAL] Fixed infinite loop in WiFi state machine (wifiConfigChanged)
- *   [PERF] Smart WiFi check frequency: 2s when connected, 500ms when not
- *   [PERF] Intelligent reconfiguration avoids redundant WiFi resets
- *   [PERF] 2-second debounce on disconnect events prevents thrashing
- *   [PERF] Flash write coalescing: 50ms → 200ms (4x flash wear reduction)
- *   [PERF] WiFi reconnection delays: 100ms → 50ms
- *   [PERF] Exponential backoff using bit-shift operations
- *   [FIX] All WiFi operations now use vTaskDelay (RTOS-safe)
- * 
- * v1.1 - Added OTA and Debug Features
- *   [NEW] Over-the-Air firmware updates with progress tracking
- *   [NEW] Task monitoring with CPU usage statistics
- *   [NEW] Persistent debug logs (reboot, WiFi, errors)
- * 
- * v1.0 - Initial Release
- *   [NEW] Base template with WiFi, BLE, and web server
- * 
- * ARCHITECTURE:
- * ----------------------------------------------------------------------------
- * • Boot Phase 1: All flash/NVS operations (config loading)
- * • Boot Phase 2: Hardware initialization (BLE, sensors)
- * • Boot Phase 3: RTOS task creation
- * • Boot Phase 4: Web server start
- * • Boot Phase 5: WiFi initialization (last to avoid conflicts)
- * 
- * TASK STRUCTURE:
- * ----------------------------------------------------------------------------
- * • systemTask (Core 0, Pri 2): WiFi, NTP, BLE reconnection, system monitoring
- * • webTask (Core 0, Pri 1): HTTP server, client handling, task stats
- * • bizTask (Core 1, Pri 1): Business logic, command processing
- * 
- * FILE STRUCTURE:
- * ----------------------------------------------------------------------------
- * • config.h              - Configuration constants
- * • types.h               - Type definitions and enums
- * • globals.h/.cpp        - Global variable declarations/definitions
- * • hardware.h/.cpp       - Hardware abstraction (temp sensor, memory)
- * • time_handler.h/.cpp   - NTP and RTC functions
- * • wifi_handler.h/.cpp   - WiFi management
- * • ble_handler.h/.cpp    - BLE server and command handling
- * • web_handler.h/.cpp    - Web server and API endpoints
- * • web_html.h            - HTML/CSS/JS content (PROGMEM)
- * • tasks.h/.cpp          - FreeRTOS tasks and message pool
- * • debug_handler.h/.cpp  - Debug logging (if DEBUG_MODE)
- * • ota_handler.h/.cpp    - OTA updates (if ENABLE_OTA)
- * • rngds_base_controller.ino - Main file (this file)
- * 
- * AUTHOR: Auto-generated template
- * LICENSE: MIT
- * ============================================================================
- */
+/* ==============================================================================
+   RNGDS_BASE_CONTROLLER.INO - Main Arduino Sketch
+   
+   Entry point for the ESP32 application:
+   
+   setup(): Initializes all subsystems in correct order:
+            - Serial communication
+            - Hardware detection
+            - NVS storage
+            - WiFi
+            - BLE (if available)
+            - Web server
+            - Debug logging
+            - FreeRTOS tasks
+   
+   loop(): Mostly empty as FreeRTOS tasks handle all operations.
+           Arduino loop() is only used for watchdog feeding and
+           periodic maintenance if needed.
+   
+   This is a FreeRTOS-based multitasking application.
+   ============================================================================== */
 
-// ============================================================================
-// INCLUDES
-// ============================================================================
 
-// Configuration and Types
 #include "config.h"
 #include "types.h"
 #include "globals.h"
 
-// Core Handlers
 #include "hardware.h"
 #include "time_handler.h"
 #include "wifi_handler.h"
@@ -90,64 +32,42 @@
 #include "web_handler.h"
 #include "tasks.h"
 
-// Optional Modules
 #if DEBUG_MODE
-#include "debug_handler.h"
+  #include "debug_handler.h"
 #endif
 
 #if ENABLE_OTA
-#include "ota_handler.h"
-#include <esp_ota_ops.h>
+  #include "ota_handler.h"
+  #include <esp_ota_ops.h>
 #endif
 
-// ESP32 System Libraries
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 
 #if ESP32_HAS_TEMP
-#include "driver/temperature_sensor.h"
+  #include "driver/temperature_sensor.h"
 #endif
 
-// ============================================================================
-// FreeRTOS Runtime Statistics Support
-// ============================================================================
-
-/**
- * @brief Configure timer for runtime statistics (called by FreeRTOS)
- */
 void configureTimerForRunTimeStats(void) {
   runtimeOffsetUs = esp_timer_get_time();
 }
 
-/**
- * @brief Get current runtime counter value in 100us ticks
- * @return Runtime counter value
- */
 uint32_t ulGetRunTimeCounterValue(void) {
   return (uint32_t)((esp_timer_get_time() - runtimeOffsetUs) / 100ULL);
 }
 
-// ============================================================================
-// SETUP - Flash-Safe Initialization Order
-// ============================================================================
-
-// ============================================================================
-// SETUP - Fixed Flash-Safe Initialization Order
-// ============================================================================
-
+/* setup: Arduino entry point - initializes all system components in correct order */
 void setup() {
   delay(300);
   Serial.begin(115200);
-  Serial.println(F("\n\n==========================================="));
-  Serial.println(F("    ESP32 BOOT - Flash-Safe Init"));
-  Serial.println(F("===========================================\n"));
+  Serial.println(F("\n\n========================================"));
+  Serial.println(F("   ESP32 BOOT - Flash-Safe Init"));
+  Serial.println(F("========================================\n"));
 
-  // Reduce log verbosity for common IDF messages
   esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_log_level_set("dhcpc", ESP_LOG_WARN);
   esp_log_level_set("phy_init", ESP_LOG_WARN);
 
-  // Initialize Task Watchdog
   esp_task_wdt_deinit();
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = (uint32_t)(WDT_TIMEOUT * 1000),
@@ -156,55 +76,61 @@ void setup() {
   };
   esp_task_wdt_init(&wdt_config);
 
-  // ===== PHASE 1: ALL FLASH OPERATIONS (NVS) =====
   Serial.println(F("Phase 1: Loading configuration from flash..."));
 
-#if DEBUG_MODE
-  flashWriteMutex = xSemaphoreCreateMutex();
-  if (!flashWriteMutex) {
-    Serial.println(F("CRITICAL: Failed to create flashWriteMutex!"));
-  }
-#endif
+  #if DEBUG_MODE
+    flashWriteMutex = xSemaphoreCreateMutex();
+    if (!flashWriteMutex) {
+      Serial.println(F("CRITICAL: Failed to create flashWriteMutex!"));
+    }
+  #endif
 
-  // Open preferences ONCE and keep it open
   if (!prefs.begin("esp32_base", false)) {
     Serial.println(F("CRITICAL: Failed to initialize Preferences!"));
     delay(5000);
     ESP.restart();
   }
 
-  // Load ALL configuration from NVS into RAM
   loadNetworkConfig();
   loadWiFiCredentials();
 
 #if DEBUG_MODE
   loadDebugLogs();
 
-  // Check reboot reason
   esp_reset_reason_t reason = esp_reset_reason();
-  bool userReq = prefs.getBool("userRebootRequested", false);
+  Serial.printf("Boot: Reset reason = %d (%s)\n", (int)reason, formatResetReason(reason).c_str());
+  
+  bool userReq = prefs.getBool(NVS_FLAG_USER_REBOOT, false);
   if (userReq) {
-    prefs.putBool("userRebootRequested", false);
-    Serial.println(F("Last reboot was user-requested"));
+    prefs.putBool(NVS_FLAG_USER_REBOOT, false);
+    Serial.println(F("Boot: User-requested reboot (flag was set)"));
   } else {
-    if (reason != ESP_RST_POWERON && reason != ESP_RST_DEEPSLEEP) {
+
+    if (reason != ESP_RST_POWERON && 
+        reason != ESP_RST_DEEPSLEEP && 
+        reason != ESP_RST_UNKNOWN) {
       String msg = "Unexpected reboot: " + formatResetReason(reason);
       addRebootLog(msg, 0);
-      Serial.printf("Boot: %s\n", msg.c_str());
+      Serial.printf("Boot: %s (logged)\n", msg.c_str());
+    } else {
+      Serial.println(F("Boot: Normal boot (not logged)"));
     }
   }
 #endif
 
-  // DON'T CLOSE PREFERENCES - Keep them open for runtime use
-  // This avoids the problematic close/reopen pattern
+  prefs.end();
+
+  Serial.println(F("Waiting for flash operations to complete..."));
+  delay(200);
+
+  if (!prefs.begin("esp32_base", false)) {
+    Serial.println(F("WARNING: Failed to reopen Preferences!"));
+  }
 
   Serial.println(F("Phase 1 complete: All config loaded into RAM\n"));
 
-  // Brief delay to ensure any pending NVS operations complete
-  delay(100);
-
-  // ===== PHASE 2: NON-NETWORK INITIALIZATION =====
   Serial.println(F("Phase 2: Initializing non-network components..."));
+  Serial.println(F("CRITICAL: Creating ALL mutexes BEFORE tasks start"));
 
 #if ESP32_HAS_TEMP
   temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
@@ -213,88 +139,97 @@ void setup() {
   }
 #endif
 
-  // Initialize message pool and mutexes
   initMessagePool();
 
-  // Initialize BLE (doesn't use TCP/IP)
   initBLE();
 
 #if DEBUG_MODE
-  // Start the background flash-writing task
+
   flashWriteQueue = xQueueCreate(FLASH_WRITE_QUEUE_SIZE, sizeof(FlashWriteRequest));
   xTaskCreate(flashWriteTask, "flash", 3072, nullptr, 0, &flashWriteTaskHandle);
 #endif
 
-  // Create command queue
   execQ = xQueueCreate(MSG_POOL_SIZE, sizeof(ExecMessage*));
 
+  registerRoutes();
+  Serial.println(F("Routes registered"));
+  
+  Serial.printf("Heap after Phase 2: Free=%u Min=%u\n", 
+                ESP.getFreeHeap(), ESP.getMinFreeHeap());
+
 #if DEBUG_MODE
-  // Initialize core runtime data
+
   for (int c = 0; c < NUM_CORES; c++) {
-    coreRuntime[c].totalRuntimeTicks = 0;
-    coreRuntime[c].prevTotalRuntimeTicks = 0;
+    coreRuntime[c].totalRuntime100ms = 0;
+    coreRuntime[c].prevTotalRuntime100ms = 0;
     coreRuntime[c].taskCount = 0;
-    coreRuntime[c].loadPercent = 0;
+    coreRuntime[c].cpuPercentTotal = 0;
   }
 #endif
 
   Serial.println(F("Phase 2 complete\n"));
 
-  // ===== PHASE 3: RTOS TASKS =====
   Serial.println(F("Phase 3: Creating RTOS tasks..."));
 
 #if NUM_CORES > 1
   xTaskCreatePinnedToCore(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle, 1);
-  xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, &webTaskHandle, 0);
-  xTaskCreatePinnedToCore(systemTask, "sys", 4096, nullptr, 2, &sysTaskHandle, 0);
+
+  xTaskCreatePinnedToCore(webTask, "web", 10240, nullptr, 1, &webTaskHandle, 0);
+
+  xTaskCreatePinnedToCore(systemTask, "sys", 12288, nullptr, 2, &sysTaskHandle, 0);
 #else
   xTaskCreate(bizTask, "biz", 4096, nullptr, 1, &bizTaskHandle);
-  xTaskCreate(webTask, "web", 8192, nullptr, 1, &webTaskHandle);
-  xTaskCreate(systemTask, "sys", 3072, nullptr, 2, &sysTaskHandle);
+
+  xTaskCreate(webTask, "web", 10240, nullptr, 1, &webTaskHandle);
+
+  xTaskCreate(systemTask, "sys", 10240, nullptr, 2, &sysTaskHandle);
 #endif
 
-  // Give tasks time to fully initialize
-  delay(300);
+  delay(500);
 
   Serial.println(F("Phase 3 complete: Tasks running\n"));
 
-  // ===== PHASE 4: WIFI (LAST!) =====
-  Serial.println(F("Phase 5: Initializing WiFi subsystem..."));
+  Serial.println(F("Phase 4: Web server prepared..."));
+  
 
-  // Configure WiFi (event handlers only - no connection)
+  
+  delay(100);
+
+  Serial.println(F("Phase 4 complete\n"));
+
+  Serial.println(F("Phase 5: Initializing WiFi & Web Server..."));
+
   setupWiFi();
+  Serial.println(F("WiFi configured (TCP/IP stack ready)"));
+  
 
-  // Initialize NTP *after* the TCP/IP stack is ready
+  Serial.printf("Heap before server.begin(): Free=%u Min=%u\n", 
+                ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  
+  server.begin();
+  Serial.println(F("Web server started"));
+  
+  Serial.printf("Heap after server.begin(): Free=%u Min=%u\n", 
+                ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  
+
+  serverStarted = true;
+  delay(100);
+
   initNTP();
 
-  // Final delay before WiFi connection
   delay(200);
 
-  // CRITICAL FIX: Reset reconnect attempts on boot
-  wifiReconnectAttempts = 0;
-  wifiFirstConnectDone = false;
-
-  // Set the initial config flag so systemTask applies config on its first run
   wifiConfigChanged = true;
   wifiState = WIFI_STATE_IDLE;
 
   Serial.println(F("Phase 5 complete: WiFi system task will now take over.\n"));
 
-  // ===== PHASE 5: WEB SERVER =====
-  Serial.println(F("Phase 4: Starting web server..."));
+  bootComplete = true;
 
-  registerRoutes();
-  server.begin();
-  serverStarted = true;
-
-  // Ensure server is fully ready
-  delay(200);
-
-  Serial.println(F("Phase 4 complete: Web server ready\n"));
-  // ===== BOOT COMPLETE =====
-  Serial.println(F("==========================================="));
-  Serial.println(F("       ESP32 SYSTEM INITIALIZED"));
-  Serial.println(F("==========================================="));
+  Serial.println(F("========================================"));
+  Serial.println(F("   ESP32 SYSTEM INITIALIZED"));
+  Serial.println(F("========================================"));
   Serial.printf("Chip: %s @ %dMHz\n", ESP.getChipModel(), ESP.getCpuFreqMHz());
   Serial.printf("Cores: %d\n", NUM_CORES);
   Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
@@ -307,7 +242,7 @@ void setup() {
   }
 
   if (wifiCredentials.hasCredentials) {
-    Serial.printf("WiFi: Will attempt to connect to '%s'...\n", wifiCredentials.ssid);
+    Serial.printf("WiFi: Will attempt to connect to %s...\n", wifiCredentials.ssid);
   } else {
     Serial.println(F("WiFi: No credentials configured"));
   }
@@ -316,8 +251,8 @@ void setup() {
   Serial.println(F("OTA: Enabled"));
   const esp_partition_t* ota_partition = esp_ota_get_next_update_partition(NULL);
   if (ota_partition) {
-    Serial.printf("OTA: Target partition '%s' available (%.2f MB)\n",
-                  ota_partition->label,
+    Serial.printf("OTA: Target partition '%s' available (%.2f MB)\n", 
+                  ota_partition->label, 
                   ota_partition->size / 1048576.0);
   } else {
     Serial.println(F("OTA: WARNING - No OTA partition found!"));
@@ -343,14 +278,7 @@ void setup() {
   Serial.println();
 }
 
-// ============================================================================
-// LOOP - Deleted (all work done in FreeRTOS tasks)
-// ============================================================================
-
-/**
- * @brief Main loop (Arduino context)
- * We delete this task as all work is done in FreeRTOS tasks
- */
+/* loop: Arduino main loop - mostly empty as FreeRTOS tasks handle everything */
 void loop() {
   vTaskDelete(NULL);
 }

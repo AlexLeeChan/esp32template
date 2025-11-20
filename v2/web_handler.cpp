@@ -1,3 +1,17 @@
+/* ==============================================================================
+   WEB_HANDLER.CPP - Web Server Implementation
+   
+   Implements HTTP server with REST API providing:
+   - System information (uptime, memory, CPU, temperature)
+   - WiFi configuration and status
+   - OTA update management
+   - Task monitoring and debugging
+   - Configuration management
+   
+   All endpoints return JSON for easy parsing by web applications.
+   Runs in dedicated FreeRTOS task (webTask) for concurrent request handling.
+   ============================================================================== */
+
 #include "web_handler.h"
 #include "globals.h"
 #include "hardware.h"
@@ -12,10 +26,8 @@
 #include "ota_handler.h"
 #endif
 
-// HTML content (PROGMEM strings)
 #include "web_html.h"
 
-// Forward declarations for helper functions
 static String cleanString(const String& input);
 static bool isValidIP(const String& s);
 static bool isValidSubnet(const String& s);
@@ -23,8 +35,12 @@ static IPAddress parseIP(const String& s);
 
 #if ENABLE_OTA
 bool isOtaActive() {
+
+  if (!otaMutex) return false;
+  
   bool active = false;
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 10ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     active = (otaStatus.state == OTA_CHECKING || 
               otaStatus.state == OTA_DOWNLOADING || 
               otaStatus.state == OTA_FLASHING);
@@ -87,11 +103,6 @@ void sendIndex() {
   server.sendContent_P(INDEX_HTML_REFRESH);
   delay(1);
 
-#if DEBUG_MODE
-  server.sendContent_P(INDEX_HTML_REFRESH_DEBUG);
-  delay(1);
-#endif
-
   server.sendContent_P(INDEX_HTML_REFRESH_END);
   delay(1);
 
@@ -128,18 +139,24 @@ void handleApiStatus() {
   bool connected = (WiFi.status() == WL_CONNECTED);
   doc["connected"] = connected;
 
+  JsonObject net = doc.createNestedObject("net");
+  net["dhcp"] = netConfig.useDHCP;
+  
   if (connected) {
     doc["ip"] = WiFi.localIP().toString();
     doc["rssi"] = WiFi.RSSI();
-    JsonObject net = doc.createNestedObject("net");
     net["ssid"] = WiFi.SSID();
-    net["dhcp"] = netConfig.useDHCP;
-    if (!netConfig.useDHCP) {
-      net["static_ip"] = netConfig.staticIP.toString();
-      net["gateway"] = netConfig.gateway.toString();
-      net["subnet"] = netConfig.subnet.toString();
-      net["dns"] = netConfig.dns.toString();
-    }
+  } else if (wifiCredentials.hasCredentials) {
+
+    net["ssid"] = String(wifiCredentials.ssid);
+  }
+  
+
+  if (!netConfig.useDHCP) {
+    net["static_ip"] = netConfig.staticIP.toString();
+    net["gateway"] = netConfig.gateway.toString();
+    net["subnet"] = netConfig.subnet.toString();
+    net["dns"] = netConfig.dns.toString();
   }
 
   doc["uptime_ms"] = millis();
@@ -153,11 +170,8 @@ void handleApiStatus() {
     doc["epoch"] = getEpochTime();
   }
 
-
   doc["core0_load"] = coreLoadPct[0];
-  #if NUM_CORES > 1
   doc["core1_load"] = coreLoadPct[1];
-  #endif
 
   doc["chip_model"] = ESP.getChipModel();
   doc["cpu_freq"] = ESP.getCpuFreqMHz();
@@ -167,7 +181,8 @@ void handleApiStatus() {
   JsonObject ota = doc.createNestedObject("ota");
 #if ENABLE_OTA
   ota["enabled"] = true;
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     ota["available"] = otaStatus.available;
     ota["state"] = (uint8_t)otaStatus.state;
     xSemaphoreGive(otaMutex);
@@ -194,7 +209,7 @@ void handleApiStatus() {
     JsonObject core = cores.createNestedObject(String(c));
     core["tasks"] = coreRuntime[c].taskCount;
     core["load_pct"] = coreLoadPct[c];
-    core["cpu_total"] = coreRuntime[c].loadPercent;
+    core["cpu_total"] = coreRuntime[c].cpuPercentTotal;
   }
 #endif
 
@@ -290,13 +305,13 @@ void handleApiNetwork() {
   String ssid = doc["ssid"] | "";
   String pass = doc["pass"] | "";
   bool dhcp = doc["dhcp"] | true;
+  
+  bool wifiCredentialsChanged = false;
 
-  if (ssid.length() == 0) {
-    server.send(400, "application/json", "{\"err\":\"SSID required\"}");
-    return;
+  if (ssid.length() > 0) {
+    saveWiFi(ssid, pass);
+    wifiCredentialsChanged = true;
   }
-
-  saveWiFi(ssid, pass);
 
   netConfig.useDHCP = dhcp;
   if (!dhcp) {
@@ -313,13 +328,19 @@ void handleApiNetwork() {
 
   saveNetworkConfig();
 
-  if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    wifiConfigChanged = true;
-    wifiState = WIFI_STATE_IDLE;
-    xSemaphoreGive(wifiMutex);
+  if (wifiCredentials.hasCredentials || wifiCredentialsChanged) {
+    /* Acquire wifiMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      wifiConfigChanged = true;
+      wifiState = WIFI_STATE_IDLE;
+      xSemaphoreGive(wifiMutex);
+    }
+    server.send(200, "application/json", "{\"msg\":\"saved, reconnecting\"}");
+  } else {
+
+    server.send(200, "application/json", "{\"msg\":\"network config saved\"}");
   }
 
-  server.send(200, "application/json", "{\"msg\":\"saved, reconnecting\"}");
   LOG_WIFI(F("Network config updated"), millis() / 1000);
 }
 
@@ -353,7 +374,7 @@ void handleApiTasks() {
     }
     t["state"] = stateName;
     
-    t["runtime"] = taskData[i].totalRuntimeSec;
+    t["runtime"] = (uint64_t)taskData[i].runtimeAccumUs / 1000000ULL;
     t["stack_hwm"] = taskData[i].stackHighWater;
     t["stack_health"] = taskData[i].stackHealth;
     t["cpu_percent"] = taskData[i].cpuPercent;
@@ -369,7 +390,7 @@ void handleApiTasks() {
   for (int c = 0; c < NUM_CORES; c++) {
     JsonObject core = coreSummary.createNestedObject(String(c));
     core["tasks"] = coreRuntime[c].taskCount;
-    core["cpu_total"] = coreRuntime[c].loadPercent;
+    core["cpu_total"] = coreRuntime[c].cpuPercentTotal;
     core["load"] = coreLoadPct[c];
   }
 
@@ -461,7 +482,6 @@ void registerRoutes() {
   });
 }
 
-// Helper functions
 static String cleanString(const String& input) {
   if (input.length() == 0) return String();
   const char* str = input.c_str();

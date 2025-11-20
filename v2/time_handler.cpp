@@ -1,3 +1,14 @@
+/* ==============================================================================
+   TIME_HANDLER.CPP - Time Management Implementation
+   
+   Implements time synchronization and formatting:
+   - Syncs with NTP servers periodically
+   - Provides epoch timestamps for events
+   - Formats time for display and logging
+   
+   Time is automatically synchronized when WiFi connects.
+   ============================================================================== */
+
 #include "time_handler.h"
 #include "globals.h"
 #include <esp_sntp.h>
@@ -6,15 +17,8 @@
 #include "debug_handler.h"
 
 void initNTP() {
-  if (timeMutex == nullptr) {
-    timeMutex = xSemaphoreCreateMutex();
-    if (!timeMutex) {
-      Serial.println(F("CRITICAL: Failed to create timeMutex!"));
-      LOG_ERROR(F("Failed to create timeMutex"), 0);
-      return;
-    }
-  }
 
+  
   sntp_setoperatingmode(SNTP_OPMODE_POLL);
   sntp_setservername(0, (char*)NTP_SERVER_1);
   sntp_setservername(1, (char*)NTP_SERVER_2);

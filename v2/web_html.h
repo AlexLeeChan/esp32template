@@ -122,13 +122,14 @@ pre {background:#0d1117;color:#c9d1d9;padding:10px;border-radius:4px;overflow-x:
   <div class="pill">Up: <span id="upt">--:--:--</span></div>
   <div class="pill">Free Heap: <span id="heap">--</span>/<span id="heapTot">--</span></div>
   <div class="pill">Temp: <span id="tempC">--</span></div>
+  <div class="pill"><span class="core-badge core-0">C0</span> <span id="c0">-</span>%</div>
+  <div class="pill" id="c1pill"><span class="core-badge core-1">C1</span> <span id="c1">-</span>%</div>
 )rawliteral";
 
 #if DEBUG_MODE
 static const char INDEX_HTML_PART1_DEBUG[] PROGMEM = R"rawliteral(
-  <div class="pill"><span class="core-badge core-0">C0</span> <span id="c0">-</span>% (<span id="c0Tasks">-</span> tasks)</div>
-  <div class="pill" id="c1pill"><span class="core-badge core-1">C1</span> <span id="c1">-</span>% (<span id="c1Tasks">-</span> tasks)</div>
-  <div class="pill">Tasks: <span id="taskCount">-</span></div>
+  <div class="pill">(<span id="c0Tasks">-</span> / <span id="c1Tasks">-</span> tasks)</div>
+  <div class="pill">Total: <span id="taskCount">-</span></div>
 )rawliteral";
 #endif
 
@@ -170,11 +171,11 @@ static const char INDEX_HTML_WIFI_CARD[] PROGMEM = R"rawliteral(
   <div>
    <div class="form-group">
     <label>SSID</label>
-    <input type="text" id="wifiSsid" placeholder="Network name">
+    <input type="text" id="wifiSsid" placeholder="Network name" autocomplete="off">
    </div>
    <div class="form-group">
     <label>Password</label>
-    <input type="password" id="wifiPass" placeholder="Password">
+    <input type="password" id="wifiPass" placeholder="Password" autocomplete="off">
    </div>
    <div class="form-group">
     <label><input type="checkbox" id="wifiDhcp" checked> DHCP</label>
@@ -184,19 +185,19 @@ static const char INDEX_HTML_WIFI_CARD[] PROGMEM = R"rawliteral(
    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
     <div class="form-group" style="margin-bottom:4px">
      <label style="font-size:0.75em">Static IP</label>
-     <input type="text" id="staticIp" placeholder="192.168.1.100" style="padding:5px;font-size:0.8em">
+     <input type="text" id="staticIp" placeholder="192.168.1.100" style="padding:5px;font-size:0.8em" autocomplete="off">
     </div>
     <div class="form-group" style="margin-bottom:4px">
      <label style="font-size:0.75em">Gateway</label>
-     <input type="text" id="gateway" placeholder="192.168.1.1" style="padding:5px;font-size:0.8em">
+     <input type="text" id="gateway" placeholder="192.168.1.1" style="padding:5px;font-size:0.8em" autocomplete="off">
     </div>
     <div class="form-group" style="margin-bottom:4px">
      <label style="font-size:0.75em">Subnet</label>
-     <input type="text" id="subnet" placeholder="255.255.255.0" style="padding:5px;font-size:0.8em">
+     <input type="text" id="subnet" placeholder="255.255.255.0" style="padding:5px;font-size:0.8em" autocomplete="off">
     </div>
     <div class="form-group" style="margin-bottom:4px">
      <label style="font-size:0.75em">DNS</label>
-     <input type="text" id="dns" placeholder="8.8.8.8" style="padding:5px;font-size:0.8em">
+     <input type="text" id="dns" placeholder="8.8.8.8" style="padding:5px;font-size:0.8em" autocomplete="off">
     </div>
    </div>
   </div>
@@ -310,11 +311,25 @@ async function pollProgress(){
    }
    const j = await r.json();
    if(!j) { setTimeout(pollProgress, 1500); return; }
-   if(j.state===0 || j.state===4 || j.state===5){
+   
+   // State 0 (IDLE) or 4 (SUCCESS) = reload to main page
+   if(j.state===0 || j.state===4){
      prog.textContent = 'Update complete. Reloading...';
      location.reload();
      return;
    }
+   
+   // State 5 (FAILED) = show error and stop polling
+   if(j.state===5){
+     isFlashing = true;  // Stop further polling
+     title.textContent = 'Update Failed';
+     status.textContent = 'The firmware update could not be completed.';
+     fill.style.width = '0%';
+     fill.style.background = '#da3633';  // Red progress bar
+     prog.innerHTML = `<strong style="color:#f85149">${j.error || 'Unknown error'}</strong><br><br><a href="/" style="color:#58a6ff;text-decoration:underline">Return to main page</a>`;
+     return;
+   }
+   
    if(j.state===1 || j.state===2) {
      title.textContent = (j.state===1) ? 'Checking...' : 'Downloading...';
      status.textContent = (j.state===1) ? 'Checking for firmware update...' : 'Downloading new firmware. Do not unplug.';
@@ -355,6 +370,36 @@ static const char INDEX_HTML_PART2[] PROGMEM = R"rawliteral(
 const I=id=>document.getElementById(id);
 let otaInterval = null;
 
+// Track last known WiFi config to detect actual changes
+// Initialize with HTML default values to properly detect first load
+let lastWifiConfig = {
+  ssid: null,
+  dhcp: true,  // Matches HTML default: <input type="checkbox" id="wifiDhcp" checked>
+  static_ip: null,
+  gateway: null,
+  subnet: null,
+  dns: null
+};
+let isFirstLoad = true;  // Flag to force population on first API response
+
+// Check if WiFi config has actually changed
+function hasWifiConfigChanged(newConfig) {
+  return newConfig.ssid !== lastWifiConfig.ssid ||
+         newConfig.dhcp !== lastWifiConfig.dhcp ||
+         newConfig.static_ip !== lastWifiConfig.static_ip ||
+         newConfig.gateway !== lastWifiConfig.gateway ||
+         newConfig.subnet !== lastWifiConfig.subnet ||
+         newConfig.dns !== lastWifiConfig.dns;
+}
+
+// Setup event listener for DHCP checkbox
+const dhcpCheckbox = I('wifiDhcp');
+if (dhcpCheckbox) {
+  dhcpCheckbox.addEventListener('change', function() {
+    I('staticIpFields').style.display = this.checked ? 'none' : 'block';
+  });
+}
+
 async function refreshOTA(){
  const j = await api('/api/ota/status');
  if(j.error)return;
@@ -375,7 +420,7 @@ async function refreshOTA(){
  
  const otaStatusEl = I('otaUpdateResult');
  if (j.state === 5) {
-   if (otaStatusEl) otaStatusEl.innerHTML = `<div class="alert error">Failed: ${j.error || 'Unknown'}. <a href="javascript:void(0)" onclick="resetOTA()">Reset?</a></div>`;
+   if (otaStatusEl) otaStatusEl.innerHTML = `<div class="alert error">Failed: ${j.error || 'Unknown'}. <a href="#" onclick="resetOTA()">Reset?</a></div>`;
  }
 }
 
@@ -444,8 +489,6 @@ function coreCls(c){
  return'core-any';
 }
 
-I('wifiDhcp').addEventListener('change',()=>{I('staticIpFields').style.display=I('wifiDhcp').checked?'none':'block';});
-
 async function startBiz(){
  const r=await api('/api/biz/start','POST');
  if(r.error)return;
@@ -477,20 +520,32 @@ async function saveNetwork(){
  const ssid=I('wifiSsid').value.trim();
  const pass=I('wifiPass').value;
  const dhcp=I('wifiDhcp').checked;
- if(!ssid){alert('Enter SSID');return;}
- const body={ssid,pass,dhcp};
+ 
+ // Build request body
+ const body={dhcp};
+ 
+ // Only include WiFi credentials if SSID is provided
+ if(ssid){
+  body.ssid=ssid;
+  body.pass=pass;
+ }
+ 
+ // Include static IP settings if not using DHCP
  if(!dhcp){
   body.static_ip=I('staticIp').value;
   body.gateway=I('gateway').value;
   body.subnet=I('subnet').value;
   body.dns=I('dns').value;
  }
+ 
  const r=await api('/api/network','POST',body);
  const res=I('networkResult');
  if(r.error||r.err){
    res.innerHTML='<div class="alert error">'+(r.error||r.err)+'</div>';
  }else{
    res.innerHTML='<div class="alert success">'+(r.msg||'Saved')+'</div>';
+   // Force refresh to get updated config
+   refresh();
  }
  setTimeout(()=>res.innerHTML='',5000);
 }
@@ -609,14 +664,9 @@ async function refresh(){
  I('upt').textContent=fmU(j.uptime_ms||0);
  I('heap').textContent=fmB(j.heap_free||0);
  I('heapTot').textContent=fmB(j.heap_total||0);
-)rawliteral";
-
-#if DEBUG_MODE
-static const char INDEX_HTML_REFRESH_DEBUG[] PROGMEM = R"rawliteral(
  I('c0').textContent=j.core0_load??'-';
  I('c1').textContent=j.core1_load??'-';
 )rawliteral";
-#endif
 
 static const char INDEX_HTML_REFRESH_END[] PROGMEM = R"rawliteral(
  I('chip').textContent=j.chip_model||'-';
@@ -640,6 +690,62 @@ static const char INDEX_HTML_REFRESH_END[] PROGMEM = R"rawliteral(
   I('bizState').textContent=j.biz.running?'RUNNING':'STOPPED';
   I('bizQueue').textContent=j.biz.queue??'-';
   I('bizProcessed').textContent=j.biz.processed??'-';
+ }
+ 
+ // Update WiFi form on first load or if config actually changed
+ if(j.net){
+  const newConfig = {
+    ssid: j.net.ssid || null,
+    dhcp: j.net.dhcp !== undefined ? j.net.dhcp : true,
+    static_ip: j.net.static_ip || null,
+    gateway: j.net.gateway || null,
+    subnet: j.net.subnet || null,
+    dns: j.net.dns || null
+  };
+  
+  // Update if first load OR config changed (and user not actively typing)
+  if(isFirstLoad || hasWifiConfigChanged(newConfig)){
+    isFirstLoad = false;  // Clear first load flag
+    
+    // Update SSID (only if not currently focused)
+    const ssidInput = I('wifiSsid');
+    if(ssidInput && newConfig.ssid && document.activeElement !== ssidInput){
+      ssidInput.value = newConfig.ssid;
+    }
+    
+    // Update DHCP checkbox (only if not currently focused)
+    const dhcpCheckbox = I('wifiDhcp');
+    if(dhcpCheckbox && document.activeElement !== dhcpCheckbox){
+      dhcpCheckbox.checked = newConfig.dhcp;
+      // Always update static IP fields visibility based on DHCP state
+      I('staticIpFields').style.display = newConfig.dhcp ? 'none' : 'block';
+    }
+    
+    // Populate Static IP fields if available (only if fields not focused)
+    if(!newConfig.dhcp){
+      const staticIpInput = I('staticIp');
+      const gatewayInput = I('gateway');
+      const subnetInput = I('subnet');
+      const dnsInput = I('dns');
+      
+      // Only update fields if they have values from backend
+      if(staticIpInput && newConfig.static_ip && document.activeElement !== staticIpInput) {
+        staticIpInput.value = newConfig.static_ip;
+      }
+      if(gatewayInput && newConfig.gateway && document.activeElement !== gatewayInput) {
+        gatewayInput.value = newConfig.gateway;
+      }
+      if(subnetInput && newConfig.subnet && document.activeElement !== subnetInput) {
+        subnetInput.value = newConfig.subnet;
+      }
+      if(dnsInput && newConfig.dns && document.activeElement !== dnsInput) {
+        dnsInput.value = newConfig.dns;
+      }
+    }
+    
+    // Update last known config
+    lastWifiConfig = newConfig;
+  }
  }
 }
 )rawliteral";

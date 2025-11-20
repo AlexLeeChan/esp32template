@@ -1,3 +1,14 @@
+/* ==============================================================================
+   HARDWARE.CPP - Hardware Abstraction Implementation
+   
+   Implements hardware access functions:
+   - Queries flash and PSRAM sizes
+   - Reads internal temperature sensor (if available)
+   - Detects hardware capabilities
+   
+   Handles differences between ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6.
+   ============================================================================== */
+
 #include "hardware.h"
 #include "globals.h"
 #include "debug_handler.h"

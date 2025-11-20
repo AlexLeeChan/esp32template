@@ -1,23 +1,23 @@
+/* ==============================================================================
+   HARDWARE.H - Hardware Abstraction Interface
+   
+   Provides hardware-specific functions:
+   - Memory information (flash, PSRAM)
+   - Temperature sensor reading
+   - Hardware capability detection
+   
+   Abstracts hardware differences between ESP32 variants.
+   ============================================================================== */
+
+/* Header guard to prevent multiple inclusion of hardware.h */
 #ifndef HARDWARE_H
 #define HARDWARE_H
 
 #include <Arduino.h>
 #include "types.h"
 
-// ============================================================================
-// HARDWARE FUNCTIONS
-// ============================================================================
-
-/**
- * @brief Get internal temperature in Celsius
- * @return Temperature or NAN if not available
- */
 float getInternalTemperatureC();
 
-/**
- * @brief Get memory information
- * @return MemoryInfo struct
- */
 MemoryInfo getMemoryInfo();
 
-#endif // HARDWARE_H
+#endif

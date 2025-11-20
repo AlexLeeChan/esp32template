@@ -1,29 +1,57 @@
+/* ==============================================================================
+   TASKS.CPP - FreeRTOS Task Implementations
+   
+   Implements concurrent task functions:
+   
+   webTask: Handles HTTP server operations, processes incoming requests,
+            manages web-based API endpoints
+   
+   bizTask: Contains main application logic, business rules, and periodic
+            operations specific to your application
+   
+   Tasks communicate via queues and synchronize via mutexes. Each task
+   includes watchdog resets and graceful shutdown support for OTA updates.
+   ============================================================================== */
+
 #include "tasks.h"
 #include "globals.h"
 #include "wifi_handler.h"
 #include "ble_handler.h"
 #include "time_handler.h"
+#include "cpu_monitor.h"
 #include "debug_handler.h"
 #include "web_handler.h"
-#include "cpu_monitor.h"
 #include <esp_task_wdt.h>
 
 #if ENABLE_OTA
-  #include <esp_ota_ops.h>
+#include <esp_ota_ops.h>
 #endif
 
 void initMessagePool() {
+
   poolMutex = xSemaphoreCreateMutex();
   if (!poolMutex) {
-    Serial.println(F("CRITICAL: Failed to create poolMutex!"));
-    LOG_ERROR(F("Failed to create poolMutex"), 0);
+    Serial.println(F("FATAL: poolMutex creation failed!"));
+    LOG_ERROR(F("poolMutex creation failed"), 0);
+    while (1) { delay(1000); }
   }
+  Serial.println(F("poolMutex created"));
 
   wifiMutex = xSemaphoreCreateMutex();
   if (!wifiMutex) {
-    Serial.println(F("CRITICAL: Failed to create wifiMutex!"));
-    LOG_ERROR(F("Failed to create wifiMutex"), 0);
+    Serial.println(F("FATAL: wifiMutex creation failed!"));
+    LOG_ERROR(F("wifiMutex creation failed"), 0);
+    while (1) { delay(1000); }
   }
+  Serial.println(F("wifiMutex created"));
+
+  timeMutex = xSemaphoreCreateMutex();
+  if (!timeMutex) {
+    Serial.println(F("FATAL: timeMutex creation failed!"));
+    LOG_ERROR(F("timeMutex creation failed"), 0);
+    while (1) { delay(1000); }
+  }
+  Serial.println(F("timeMutex created"));
 
   for (int i = 0; i < MSG_POOL_SIZE; i++) {
     msgPool[i].inUse = false;
@@ -33,15 +61,19 @@ void initMessagePool() {
 #if ENABLE_OTA
   otaMutex = xSemaphoreCreateMutex();
   if (!otaMutex) {
-    Serial.println(F("CRITICAL: Failed to create otaMutex!"));
-    LOG_ERROR(F("Failed to create otaMutex"), 0);
+    Serial.println(F("FATAL: otaMutex creation failed!"));
+    LOG_ERROR(F("otaMutex creation failed"), 0);
+    while (1) { delay(1000); }
   }
+  Serial.println(F("otaMutex created"));
 
   taskDeletionMutex = xSemaphoreCreateMutex();
   if (!taskDeletionMutex) {
-    Serial.println(F("CRITICAL: Failed to create taskDeletionMutex!"));
-    LOG_ERROR(F("Failed to create taskDeletionMutex"), 0);
+    Serial.println(F("FATAL: taskDeletionMutex creation failed!"));
+    LOG_ERROR(F("taskDeletionMutex creation failed"), 0);
+    while (1) { delay(1000); }
   }
+  Serial.println(F("taskDeletionMutex created"));
 
   tasksDeleted = false;
   webTaskShouldExit = false;
@@ -49,7 +81,8 @@ void initMessagePool() {
   otaInProgress = false;
 
   const esp_partition_t* ota_partition = esp_ota_get_next_update_partition(NULL);
-  if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  /* Acquire otaMutex mutex (wait up to 100ms) to safely access shared resource */
+    if (xSemaphoreTake(otaMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     otaStatus.available = (ota_partition != NULL);
     #if DEBUG_MODE
     if (!otaStatus.available) {
@@ -62,7 +95,7 @@ void initMessagePool() {
 }
 
 ExecMessage* allocMessage() {
-  if (xSemaphoreTake(poolMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  if (poolMutex && xSemaphoreTake(poolMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     for (int i = 0; i < MSG_POOL_SIZE; i++) {
       if (!msgPool[i].inUse) {
         msgPool[i].inUse = true;
@@ -72,12 +105,12 @@ ExecMessage* allocMessage() {
     }
     xSemaphoreGive(poolMutex);
   }
-  LOG_ERROR(F("Message pool exhausted"), millis() / 1000);
+  LOG_ERROR(F("Message pool exhausted or mutex NULL"), millis() / 1000);
   return nullptr;
 }
 
 void freeMessage(ExecMessage* msg) {
-  if (msg && xSemaphoreTake(poolMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+  if (msg && poolMutex && xSemaphoreTake(poolMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     msg->inUse = false;
     msg->length = 0;
     xSemaphoreGive(poolMutex);
@@ -86,7 +119,7 @@ void freeMessage(ExecMessage* msg) {
 
 void systemTask(void* param) {
   (void)param;
-  esp_task_wdt_add(NULL);
+  esp_task_wdt_add(NULL);  /* Register this task with watchdog timer */
   bool ledState = false;
   uint32_t ledTs = 0;
   uint32_t lastNtpCheck = 0;
@@ -97,6 +130,11 @@ void systemTask(void* param) {
 
   for (;;) {
     esp_task_wdt_reset();
+
+    if (!bootComplete) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
 
 #if ENABLE_OTA
     if (otaInProgress) {
@@ -126,9 +164,8 @@ void systemTask(void* param) {
 
     handleBLEReconnect();
 
-    // Always update CPU load (not just in DEBUG_MODE)
     updateCpuLoad();
-    
+
 #if DEBUG_MODE
     checkTaskStacks();
 #endif
@@ -152,7 +189,7 @@ void systemTask(void* param) {
 
 void webTask(void* param) {
   (void)param;
-  esp_task_wdt_add(NULL);
+  esp_task_wdt_add(NULL);  /* Register this task with watchdog timer */
 
   for (;;) {
 #if ENABLE_OTA
@@ -167,7 +204,11 @@ void webTask(void* param) {
 #endif
 
     esp_task_wdt_reset();
-    server.handleClient();
+    
+
+    if (serverStarted) {
+      server.handleClient();
+    }
 
 #if DEBUG_MODE
     if (!isOtaActive()) {
@@ -177,13 +218,13 @@ void webTask(void* param) {
     }
 #endif
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(10));  /* Yield to other tasks (10ms sleep) */
   }
 }
 
 void bizTask(void* param) {
   (void)param;
-  esp_task_wdt_add(NULL);
+  esp_task_wdt_add(NULL);  /* Register this task with watchdog timer */
   ExecMessage* msg = nullptr;
 
   for (;;) {
@@ -223,7 +264,10 @@ void bizTask(void* param) {
             msg = nullptr;
             vTaskDelay(pdMS_TO_TICKS(500));
             #if DEBUG_MODE
-            prefs.putBool("userRebootRequested", true);
+            prefs.putBool(NVS_FLAG_USER_REBOOT, true);
+            prefs.end();
+            delay(50);
+            prefs.begin("esp32_base", false);
             #endif
             ESP.restart();
           } else {
