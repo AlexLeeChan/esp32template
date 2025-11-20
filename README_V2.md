@@ -872,36 +872,6 @@ if (millis() - lastReading > 60000) {  // Every minute
 }
 ```
 
-### Example 3: State Machine
-
-```cpp
-enum MyState { IDLE, ACTIVE, ERROR };
-MyState myState = IDLE;
-
-// In command handler:
-if (cmd.equals("start")) {
-  myState = ACTIVE;
-}
-else if (cmd.equals("stop")) {
-  myState = IDLE;
-}
-
-// In periodic work:
-switch (myState) {
-  case IDLE:
-    // Do nothing
-    break;
-  case ACTIVE:
-    // Do work
-    break;
-  case ERROR:
-    // Handle error
-    break;
-}
-```
-
----
-
 ## 🔍 Troubleshooting
 
 ### Common Issues
@@ -1070,31 +1040,6 @@ pio device monitor
 4. Select your board and port
 5. Click Upload
 
----
-
-## 📊 Migration from V1
-
-**Benefits of Migrating:**
-* ✅ Better code organization
-* ✅ Easier to debug and maintain
-* ✅ Persistent logging
-* ✅ NTP time synchronization
-* ✅ Flash-safe operations
-* ✅ Team-friendly structure
-
-**Migration Steps:**
-
-1. **Copy your bizTask code** from V1
-2. **Create new V2 project** with modular files
-3. **Paste bizTask code** into `tasks.cpp`
-4. **Update config.h** with your settings
-5. **Test thoroughly** with DEBUG_MODE enabled
-6. **Deploy**
-
-**Breaking Changes:**
-* Global variables moved to `globals.h/cpp`
-* Configuration moved to `config.h`
-* Some functions renamed for clarity
 
 ---
 
