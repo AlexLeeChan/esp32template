@@ -4,6 +4,18 @@ A comprehensive, production-ready RTOS template for building robust applications
 
 **Configure WiFi through BLE from your browser!** Includes OTA firmware updates, web dashboard, and advanced task monitoring.
 
+<table>
+  <tr>
+    <td valign="top">
+      <img width="422" alt="obrazek" src="https://github.com/user-attachments/assets/40cb1188-54e2-4afc-865c-e0f1e120adc1" />
+    </td>
+    <td width="20"></td>
+    <td valign="top">
+      <img width="215" alt="obrazek" src="https://github.com/user-attachments/assets/57e9e4aa-735b-47e3-a9f4-a9e54714830a" />
+    </td>
+  </tr>
+</table>
+
 ---
 
 ## 📦 Available Versions
